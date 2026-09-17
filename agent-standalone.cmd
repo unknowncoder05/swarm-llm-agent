@@ -194,27 +194,76 @@ function Get-OllamaPath {
 }
 
 function Install-Ollama {
-    Write-Step "Downloading Ollama installer..."
-    $installer = Join-Path $env:TEMP "OllamaSetup.exe"
-    $attempts = 0
-    while ($attempts -lt 3) {
+    # Fast path 1: winget — instant if available, no download needed
+    if (Get-Command winget -ErrorAction SilentlyContinue) {
+        Write-Step "Trying winget (fastest path)..."
+        Write-Status "INSTALLING" "installing via winget..."
+        winget install --id Ollama.Ollama --silent `
+            --accept-package-agreements --accept-source-agreements 2>&1 | Out-Null
+        $path = Get-OllamaPath
+        if ($path) { Write-Ok "Installed via winget: $path"; return $path }
+        Write-Step "winget did not produce Ollama — falling back to portable zip"
+    }
+
+    # Primary download method: portable zip (no installer, no UAC, no admin required)
+    $cacheDir   = Join-Path $env:LOCALAPPDATA "swarm-llm"
+    $installDir = Join-Path $env:LOCALAPPDATA "Programs\Ollama"
+    if (-not (Test-Path $cacheDir))   { New-Item -ItemType Directory -Path $cacheDir   | Out-Null }
+    if (-not (Test-Path $installDir)) { New-Item -ItemType Directory -Path $installDir | Out-Null }
+    $zipFile = Join-Path $cacheDir "ollama-windows-amd64.zip"
+
+    $useCached = (Test-Path $zipFile) -and
+                 ((Get-Item $zipFile).Length -gt 100MB) -and
+                 ((Get-Date) - (Get-Item $zipFile).LastWriteTime).TotalHours -lt 8
+
+    if ($useCached) {
+        $ageMin = [math]::Round(((Get-Date) - (Get-Item $zipFile).LastWriteTime).TotalMinutes)
+        Write-Ok "Using cached zip (${ageMin}m old) — skipping download"
+        Write-Status "INSTALLING" "using cached zip (${ageMin}m old)"
+    } else {
+        # Prefer coordinator mirror (EC2 bandwidth) over GitHub
+        $mirrorUrl   = "$script:Coordinator/ollama/ollama-windows-amd64.zip"
+        $officialUrl = "https://github.com/ollama/ollama/releases/latest/download/ollama-windows-amd64.zip"
+        $downloadUrl = $officialUrl
         try {
-            Invoke-WebRequest -Uri "https://ollama.com/download/OllamaSetup.exe" `
-                -OutFile $installer -UseBasicParsing
-            break
-        } catch {
-            $attempts++
-            if ($attempts -ge 3) { throw "Download failed after 3 attempts: $_" }
-            Write-Err "Retrying ($attempts/3)..."
-            Start-Sleep 2
+            $head = Invoke-WebRequest -Uri $mirrorUrl -Method Head -UseBasicParsing -TimeoutSec 4 -ErrorAction Stop
+            if ($head.StatusCode -eq 200) { $downloadUrl = $mirrorUrl; Write-Step "Using coordinator mirror" }
+        } catch { }
+
+        $attempts = 0
+        while ($attempts -lt 3) {
+            try {
+                Remove-Item $zipFile -ErrorAction SilentlyContinue
+                Write-Step "Downloading Ollama from $downloadUrl ..."
+                $dlJob = Start-Job -ScriptBlock {
+                    [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+                    Invoke-WebRequest -Uri $using:downloadUrl -OutFile $using:zipFile -UseBasicParsing
+                }
+                while ($dlJob.State -eq "Running") {
+                    Start-Sleep 5
+                    $mb = if (Test-Path $zipFile) { [math]::Round((Get-Item $zipFile).Length / 1MB, 0) } else { 0 }
+                    Write-Status "INSTALLING" "downloading Ollama... ${mb} MB"
+                }
+                Receive-Job $dlJob -ErrorAction Stop | Out-Null
+                Remove-Job $dlJob
+                break
+            } catch {
+                Remove-Job $dlJob -Force -ErrorAction SilentlyContinue
+                $attempts++
+                if ($attempts -ge 3) { throw "Download failed after 3 attempts: $_" }
+                Write-Err "Retrying ($attempts/3)..."
+                Start-Sleep 2
+            }
         }
     }
-    Write-Step "Installing Ollama (no admin required)..."
-    Start-Process -FilePath $installer -ArgumentList "/S" -Wait -NoNewWindow
-    Start-Sleep 2
+
+    Write-Status "INSTALLING" "extracting Ollama..."
+    Write-Step "Extracting to $installDir ..."
+    Expand-Archive -Path $zipFile -DestinationPath $installDir -Force
+
     $path = Get-OllamaPath
-    if (-not $path) { throw "Ollama not found after install. Check %LOCALAPPDATA%\Programs\Ollama" }
-    Write-Ok "Ollama installed at: $path"
+    if (-not $path) { throw "Ollama not found after extract — check $installDir" }
+    Write-Ok "Ollama ready at: $path"
     return $path
 }
 
@@ -269,18 +318,39 @@ function Register-WithCoordinator([string]$coordinator, [string]$apiKey, [int]$p
 }
 
 function Test-CoordinatorReachable([string]$coordinator, [string]$apiKey) {
-    Write-Step "Pinging coordinator at $coordinator ..."
+    # Step 1: connectivity — /healthz has no auth, confirms the server is up
+    Write-Step "Connecting to coordinator at $coordinator ..."
     try {
         $r = Invoke-WebRequest -Uri "$coordinator/healthz" `
             -UseBasicParsing -TimeoutSec 8 -ErrorAction Stop
-        if ($r.StatusCode -eq 200) {
-            Write-Ok "Coordinator is reachable."
-            return $true
+        if ($r.StatusCode -ne 200) { throw "unexpected status $($r.StatusCode)" }
+    } catch {
+        Write-Err "Cannot reach coordinator at $coordinator"
+        Write-Err "Check the URL and make sure the server is running."
+        return $false
+    }
+
+    # Step 2: auth check — validate key against /agent-status before spending
+    #         time installing Ollama or pulling a model
+    Write-Step "Validating API key ..."
+    try {
+        $body = @{ phase = "CONNECTING"; detail = ""; hostname = $env:COMPUTERNAME; model = $script:Model } | ConvertTo-Json
+        Invoke-RestMethod -Uri "$coordinator/agent-status" `
+            -Method Post -Body $body -ContentType "application/json" `
+            -Headers @{ "X-API-Key" = $apiKey } `
+            -TimeoutSec 8 -ErrorAction Stop | Out-Null
+    } catch {
+        $code = if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode } else { 0 }
+        if ($code -eq 401) {
+            Write-Err "API key rejected (401) — check the key you entered and try again."
+        } else {
+            Write-Err "Key validation failed: $_"
         }
-    } catch { }
-    Write-Err "Cannot reach coordinator at $coordinator"
-    Write-Err "Check the URL and make sure the server is running before downloading the model."
-    return $false
+        return $false
+    }
+
+    Write-Ok "Connected — key valid."
+    return $true
 }
 
 function Write-Status([string]$phase, [string]$detail = "") {
@@ -422,8 +492,7 @@ if ($interactive) {
     Write-Host ""
 }
 
-# 1. Ping coordinator before doing anything else
-Write-Status "CONNECTING"
+# 1. Verify coordinator is reachable AND API key is valid before doing anything else
 if (-not (Test-CoordinatorReachable $Coordinator $ApiKey)) {
     exit 1
 }
@@ -431,7 +500,6 @@ if (-not (Test-CoordinatorReachable $Coordinator $ApiKey)) {
 # 2. Ensure Ollama is present
 $ollamaExe = Get-OllamaPath
 if (-not $ollamaExe) {
-    Write-Status "INSTALLING" "downloading Ollama"
     $ollamaExe = Install-Ollama
 } else {
     Write-Ok "Ollama found at: $ollamaExe"
