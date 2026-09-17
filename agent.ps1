@@ -171,7 +171,7 @@ function Get-SystemInfo([hashtable]$hw) {
     } catch { }
     try {
         $ver = & $script:ollamaExe --version 2>&1
-        $info.ollama_version = ($ver -replace "ollama version ", "").Trim()
+        $info.ollama_version = ($ver -replace "ollama version (is )?", "").Trim()
     } catch { }
     return $info
 }
