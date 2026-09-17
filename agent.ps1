@@ -373,21 +373,64 @@ function Write-Status([string]$phase, [string]$detail = "") {
     }
 }
 
-function Start-HeartbeatLoop([string]$coordinator, [string]$apiKey, [string]$ip, [int]$port) {
-    $headers = @{ "X-API-Key" = $apiKey }
-    Write-Status "RUNNING" "heartbeat every 15s — press Ctrl+C to disconnect"
+function Start-WorkLoop([string]$coordinator, [string]$apiKey, [string]$ip, [int]$port, [string]$model) {
+    $headers  = @{ "X-API-Key" = $apiKey }
+    $modelEnc = [Uri]::EscapeDataString($model)
+    $pollUrl  = "$coordinator/agent/jobs/next?model=$modelEnc"
+    $lastHB   = [DateTime]::MinValue
+
+    Write-Status "RUNNING" "polling for jobs every 2s — Ctrl+C to quit"
     while ($true) {
-        try {
-            $body = @{ port = $port } | ConvertTo-Json
-            Invoke-RestMethod -Uri "$coordinator/heartbeat" `
-                -Method Post -Body $body -ContentType "application/json" `
-                -Headers $headers | Out-Null
-            Write-Status "HEARTBEAT" "OK"
-        } catch {
-            Write-Err "Heartbeat failed: $_ (coordinator unreachable)"
-            Write-Status "HEARTBEAT_FAILED" "$_"
+        # heartbeat every 15s
+        if (([DateTime]::UtcNow - $lastHB).TotalSeconds -ge 15) {
+            try {
+                Invoke-RestMethod -Uri "$coordinator/heartbeat" -Method Post `
+                    -Body (@{ port = $port } | ConvertTo-Json) `
+                    -ContentType "application/json" `
+                    -Headers $headers -ErrorAction SilentlyContinue | Out-Null
+            } catch { }
+            $lastHB = [DateTime]::UtcNow
         }
-        Start-Sleep 15
+
+        # poll for next job (204 = empty queue, 200 = job available)
+        try {
+            $resp = Invoke-WebRequest -Uri $pollUrl -Method Get `
+                -Headers $headers -UseBasicParsing -ErrorAction Stop
+
+            if ($resp.StatusCode -ne 200) { Start-Sleep 2; continue }
+
+            $job         = $resp.Content | ConvertFrom-Json
+            $jobId       = $job.id
+            $jobBodyJson = $job.body | ConvertTo-Json -Depth 10
+            Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Job $jobId — inferring..." -ForegroundColor DarkCyan
+            $t0 = [DateTime]::UtcNow
+
+            try {
+                $result = Invoke-RestMethod -Uri "http://127.0.0.1:$port/v1/chat/completions" `
+                    -Method Post -Body $jobBodyJson -ContentType "application/json" `
+                    -TimeoutSec 300 -ErrorAction Stop
+                $ms = ([DateTime]::UtcNow - $t0).TotalMilliseconds
+
+                Invoke-RestMethod -Uri "$coordinator/agent/jobs/$jobId/result" `
+                    -Method Post -ContentType "application/json" `
+                    -Body (@{ result = $result; elapsed_ms = [math]::Round($ms, 1) } | ConvertTo-Json -Depth 20) `
+                    -Headers $headers -ErrorAction SilentlyContinue | Out-Null
+                Write-Ok "Job $jobId done in $([math]::Round($ms / 1000, 1))s"
+            } catch {
+                $err = "$_"
+                Write-Err "Job $jobId failed: $err"
+                try {
+                    Invoke-RestMethod -Uri "$coordinator/agent/jobs/$jobId/result" `
+                        -Method Post -ContentType "application/json" `
+                        -Body (@{ error = $err } | ConvertTo-Json) `
+                        -Headers $headers -ErrorAction SilentlyContinue | Out-Null
+                } catch { }
+            }
+        } catch {
+            # real poll errors (network, auth) — silently retry
+        }
+
+        Start-Sleep 2
     }
 }
 
@@ -585,5 +628,5 @@ if (-not $SkipModelPull) {
 Write-Status "REGISTERING" ""
 $myIp = Register-WithCoordinator $Coordinator $ApiKey $OllamaPort $Model $hw
 
-# 8. Heartbeat (keeps terminal open)
-Start-HeartbeatLoop $Coordinator $ApiKey $myIp $OllamaPort
+# 8. Work loop — polls coordinator for jobs, runs inference locally, posts results
+Start-WorkLoop $Coordinator $ApiKey $myIp $OllamaPort $Model
