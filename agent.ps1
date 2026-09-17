@@ -2,35 +2,27 @@
 <#
 .SYNOPSIS
     Sets up Ollama + a coding LLM on a university Windows machine and registers
-    it with a central coordinator running on your laptop.
+    it with a central coordinator.
 
 .EXAMPLE
-    # Basic — coordinator on your laptop at 192.168.1.10
-    iwr -useb https://raw.githubusercontent.com/YOUR_USER/swarm-llm/main/agent/agent.ps1 |
-        iex; Start-Agent -Coordinator http://192.168.1.10:8080
+    # Interactive wizard (recommended — auto-detects hardware, shows model menu):
+    .\agent.ps1
 
-    # Or download first, then run with params:
-    .\agent.ps1 -Coordinator http://192.168.1.10:8080 -Model qwen2.5-coder:3b
+    # Non-interactive (CI / scripted):
+    .\agent.ps1 -Coordinator https://1.2.3.4:8443 -ApiKey abc123 -Model qwen2.5-coder:7b
 #>
 param(
-    [Parameter(Mandatory=$true)]
-    [string]$Coordinator,           # e.g. https://192.168.1.10:8443
-
-    [Parameter(Mandatory=$true)]
-    [string]$ApiKey,                # shared secret — get it from the person running the coordinator
-
-    [string]$Model = "qwen2.5-coder:14b",
-
-    [int]$OllamaPort = 11434,
-
-    [switch]$SkipModelPull          # use if model is already cached from earlier in the session
+    [string]$Coordinator = "",
+    [string]$ApiKey      = "",
+    [string]$Model       = "",
+    [int]$OllamaPort     = 11434,
+    [switch]$SkipModelPull
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-# Allow self-signed TLS certs (PS5 compatible).
-# SkipCertificateCheck param only exists in PS6+; this callback covers PS5.
+# Allow self-signed TLS (PS5 compatible — SkipCertificateCheck is PS6+ only)
 if (-not ([System.Management.Automation.PSTypeName]'TrustAllCerts').Type) {
     Add-Type -TypeDefinition @"
 using System.Net;
@@ -44,40 +36,142 @@ public class TrustAllCerts : ICertificatePolicy {
 [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCerts
 [System.Net.ServicePointManager]::SecurityProtocol  = [System.Net.SecurityProtocolType]::Tls12
 
-# ── helpers ──────────────────────────────────────────────────────────────────
+# ── console helpers ───────────────────────────────────────────────────────────
 
-function Write-Step([string]$msg) {
-    Write-Host "[*] $msg" -ForegroundColor Cyan
+function Write-Step([string]$msg) { Write-Host "[*] $msg" -ForegroundColor Cyan }
+function Write-Ok([string]$msg)   { Write-Host "[+] $msg" -ForegroundColor Green }
+function Write-Err([string]$msg)  { Write-Host "[!] $msg" -ForegroundColor Red }
+
+function Show-Banner {
+    Clear-Host
+    Write-Host ""
+    Write-Host "  ███████╗██╗    ██╗ █████╗ ██████╗ ███╗   ███╗    ██╗     ██╗     ███╗   ███╗" -ForegroundColor Cyan
+    Write-Host "  ██╔════╝██║    ██║██╔══██╗██╔══██╗████╗ ████║    ██║     ██║     ████╗ ████║" -ForegroundColor Cyan
+    Write-Host "  ███████╗██║ █╗ ██║███████║██████╔╝██╔████╔██║    ██║     ██║     ██╔████╔██║" -ForegroundColor Cyan
+    Write-Host "  ╚════██║██║███╗██║██╔══██║██╔══██╗██║╚██╔╝██║    ██║     ██║     ██║╚██╔╝██║" -ForegroundColor Cyan
+    Write-Host "  ███████║╚███╔███╔╝██║  ██║██║  ██║██║ ╚═╝ ██║    ███████╗███████╗██║ ╚═╝ ██║" -ForegroundColor Cyan
+    Write-Host "  ╚══════╝ ╚══╝╚══╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝    ╚══════╝╚══════╝╚═╝     ╚═╝" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "  University Machine Agent  |  TLS ON  |  API Key Auth ON" -ForegroundColor DarkCyan
+    Write-Host ""
 }
-function Write-Ok([string]$msg) {
-    Write-Host "[+] $msg" -ForegroundColor Green
+
+# Arrow-key choice list. Returns the selected item.
+function Show-ChoiceList([string]$prompt, [string[]]$items, [int]$defaultIndex = 0) {
+    $selected = $defaultIndex
+    $top = [Console]::CursorTop
+
+    while ($true) {
+        # Redraw
+        [Console]::SetCursorPosition(0, $top)
+        Write-Host "  $prompt" -ForegroundColor Yellow
+        Write-Host ""
+        for ($i = 0; $i -lt $items.Count; $i++) {
+            if ($i -eq $selected) {
+                Write-Host "   > $($items[$i])" -ForegroundColor White -BackgroundColor DarkBlue
+            } else {
+                Write-Host "     $($items[$i])" -ForegroundColor Gray
+            }
+        }
+        Write-Host ""
+        Write-Host "  [↑/↓] navigate   [Enter] select" -ForegroundColor DarkGray
+
+        $key = [Console]::ReadKey($true)
+        switch ($key.Key) {
+            "UpArrow"   { if ($selected -gt 0)                { $selected-- } }
+            "DownArrow" { if ($selected -lt $items.Count - 1) { $selected++ } }
+            "Enter"     { Write-Host ""; return $items[$selected] }
+            "Escape"    { throw "Cancelled" }
+        }
+    }
 }
-function Write-Err([string]$msg) {
-    Write-Host "[!] $msg" -ForegroundColor Red
+
+function Read-MaskedInput([string]$prompt) {
+    Write-Host "  $prompt" -NoNewline -ForegroundColor Yellow
+    $secure = Read-Host -AsSecureString
+    $ptr = [System.Runtime.InteropServices.Marshal]::SecureStringToGlobalAllocUnicode($secure)
+    try { return [System.Runtime.InteropServices.Marshal]::PtrToStringUni($ptr) }
+    finally { [System.Runtime.InteropServices.Marshal]::ZeroFreeGlobalAllocUnicode($ptr) }
 }
+
+# ── hardware detection ────────────────────────────────────────────────────────
+
+function Get-HardwareQuick {
+    $hw = @{ vram_gb = 0; ram_gb = 0; gpu_name = "none"; cpu_name = "unknown" }
+    try {
+        $smi = nvidia-smi --query-gpu=name,memory.total --format=csv,noheader,nounits 2>$null
+        if ($LASTEXITCODE -eq 0 -and $smi) {
+            $parts = $smi -split ","
+            $hw.gpu_name = $parts[0].Trim()
+            $hw.vram_gb  = [math]::Round([double]$parts[1].Trim() / 1024, 1)
+        }
+    } catch { }
+    try {
+        $os = Get-WmiObject Win32_OperatingSystem -ErrorAction Stop
+        $hw.ram_gb = [math]::Round($os.TotalVisibleMemorySize / 1MB, 0)
+    } catch { }
+    try {
+        $cpu = Get-WmiObject Win32_Processor -ErrorAction Stop | Select-Object -First 1
+        $hw.cpu_name = $cpu.Name.Trim()
+    } catch { }
+    return $hw
+}
+
+# Pick recommended model index based on VRAM
+function Get-RecommendedModelIndex([double]$vramGb) {
+    if     ($vramGb -ge 12) { return 4 }  # 14b
+    elseif ($vramGb -ge 6)  { return 3 }  # 7b
+    elseif ($vramGb -ge 3)  { return 2 }  # 3b
+    elseif ($vramGb -ge 1)  { return 1 }  # 1.5b
+    else                    { return 0 }  # 0.5b (CPU / unknown)
+}
+
+# ── system info (full, for registration) ──────────────────────────────────────
+
+function Get-SystemInfo([hashtable]$hw) {
+    $info = @{
+        hostname       = $env:COMPUTERNAME
+        cpu_name       = $hw.cpu_name
+        cpu_cores      = $null
+        ram_total_gb   = $hw.ram_gb
+        ram_free_gb    = $null
+        gpu_name       = if ($hw.gpu_name -ne "none") { $hw.gpu_name } else { $null }
+        gpu_vram_gb    = if ($hw.vram_gb -gt 0)       { $hw.vram_gb }  else { $null }
+        ollama_version = "?"
+        os_version     = [System.Environment]::OSVersion.VersionString
+    }
+    try {
+        $cpu = Get-WmiObject Win32_Processor -ErrorAction Stop | Select-Object -First 1
+        $info.cpu_cores = [int]$cpu.NumberOfLogicalProcessors
+    } catch { }
+    try {
+        $os = Get-WmiObject Win32_OperatingSystem -ErrorAction Stop
+        $info.ram_free_gb = [math]::Round($os.FreePhysicalMemory / 1MB, 2)
+    } catch { }
+    try {
+        $ver = & $script:ollamaExe --version 2>&1
+        $info.ollama_version = ($ver -replace "ollama version ", "").Trim()
+    } catch { }
+    return $info
+}
+
+# ── ollama helpers ────────────────────────────────────────────────────────────
 
 function Get-OllamaPath {
-    # Check if already on PATH
     $found = Get-Command ollama -ErrorAction SilentlyContinue
     if ($found) { return $found.Source }
-
-    # Common install locations (no-admin install)
     $candidates = @(
         "$env:LOCALAPPDATA\Programs\Ollama\ollama.exe",
         "$env:USERPROFILE\AppData\Local\Programs\Ollama\ollama.exe",
         "$env:TEMP\ollama\ollama.exe"
     )
-    foreach ($c in $candidates) {
-        if (Test-Path $c) { return $c }
-    }
+    foreach ($c in $candidates) { if (Test-Path $c) { return $c } }
     return $null
 }
 
 function Install-Ollama {
     Write-Step "Downloading Ollama installer..."
     $installer = Join-Path $env:TEMP "OllamaSetup.exe"
-
-    # Retry up to 3 times
     $attempts = 0
     while ($attempts -lt 3) {
         try {
@@ -86,28 +180,21 @@ function Install-Ollama {
             break
         } catch {
             $attempts++
-            if ($attempts -ge 3) { throw "Failed to download Ollama after 3 attempts: $_" }
-            Write-Err "Download failed, retrying ($attempts/3)..."
+            if ($attempts -ge 3) { throw "Download failed after 3 attempts: $_" }
+            Write-Err "Retrying ($attempts/3)..."
             Start-Sleep 2
         }
     }
-
     Write-Step "Installing Ollama (no admin required)..."
-    # /S = silent; Ollama installs to %LOCALAPPDATA%\Programs\Ollama without elevation
     Start-Process -FilePath $installer -ArgumentList "/S" -Wait -NoNewWindow
-
-    # Give the installer a moment to finish writing files
     Start-Sleep 2
-
     $path = Get-OllamaPath
-    if (-not $path) {
-        throw "Ollama installation completed but binary not found. Check %LOCALAPPDATA%\Programs\Ollama"
-    }
+    if (-not $path) { throw "Ollama not found after install. Check %LOCALAPPDATA%\Programs\Ollama" }
     Write-Ok "Ollama installed at: $path"
     return $path
 }
 
-function Wait-OllamaReady([string]$ollamaExe, [int]$port, [int]$timeoutSec = 60) {
+function Wait-OllamaReady([int]$port, [int]$timeoutSec = 60) {
     $deadline = (Get-Date).AddSeconds($timeoutSec)
     while ((Get-Date) -lt $deadline) {
         try {
@@ -120,115 +207,46 @@ function Wait-OllamaReady([string]$ollamaExe, [int]$port, [int]$timeoutSec = 60)
     return $false
 }
 
-function Get-SystemInfo {
-    $info = @{}
+# ── coordinator comms ─────────────────────────────────────────────────────────
 
-    # hostname
-    $info.hostname = $env:COMPUTERNAME
-
-    # CPU
-    try {
-        $cpu = Get-WmiObject Win32_Processor -ErrorAction Stop | Select-Object -First 1
-        $info.cpu_name  = $cpu.Name.Trim()
-        $info.cpu_cores = [int]$cpu.NumberOfLogicalProcessors
-    } catch {
-        $info.cpu_name  = "unknown"
-        $info.cpu_cores = $null
-    }
-
-    # RAM
-    try {
-        $os = Get-WmiObject Win32_OperatingSystem -ErrorAction Stop
-        $info.ram_total_gb = [math]::Round($os.TotalVisibleMemorySize / 1MB, 2)
-        $info.ram_free_gb  = [math]::Round($os.FreePhysicalMemory    / 1MB, 2)
-    } catch {
-        $info.ram_total_gb = $null
-        $info.ram_free_gb  = $null
-    }
-
-    # GPU (prefer nvidia-smi for accuracy; fall back to WMI)
-    $info.gpu_name    = $null
-    $info.gpu_vram_gb = $null
-    try {
-        $smi = nvidia-smi --query-gpu=name,memory.total --format=csv,noheader,nounits 2>$null
-        if ($LASTEXITCODE -eq 0 -and $smi) {
-            $parts = $smi -split ","
-            $info.gpu_name    = $parts[0].Trim()
-            $info.gpu_vram_gb = [math]::Round([double]$parts[1].Trim() / 1024, 2)
-        }
-    } catch { }
-
-    if (-not $info.gpu_name) {
-        try {
-            $gpu = Get-WmiObject Win32_VideoController -ErrorAction Stop |
-                   Where-Object { $_.AdapterRAM -gt 0 } | Select-Object -First 1
-            if ($gpu) {
-                $info.gpu_name    = $gpu.Name
-                $info.gpu_vram_gb = [math]::Round($gpu.AdapterRAM / 1GB, 2)
-            }
-        } catch { }
-    }
-
-    # Ollama version
-    try {
-        $ver = & $script:ollamaExe --version 2>&1
-        $info.ollama_version = ($ver -replace "ollama version ", "").Trim()
-    } catch {
-        $info.ollama_version = "?"
-    }
-
-    # OS
-    $info.os_version = [System.Environment]::OSVersion.VersionString
-
-    return $info
-}
-
-function Register-WithCoordinator([string]$coordinator, [int]$port, [string]$model) {
+function Register-WithCoordinator([string]$coordinator, [string]$apiKey, [int]$port, [string]$model, [hashtable]$hw) {
     $myIp = (
         Get-NetIPAddress -AddressFamily IPv4 |
         Where-Object { $_.IPAddress -notlike "127.*" -and $_.IPAddress -notlike "169.*" } |
         Select-Object -First 1
     ).IPAddress
+    if (-not $myIp) { throw "Could not determine local IP" }
 
-    if (-not $myIp) {
-        throw "Could not determine local IP address"
-    }
-
-    Write-Step "Collecting system information..."
-    $sysInfo = Get-SystemInfo
+    Write-Step "Collecting system info..."
+    $sysInfo = Get-SystemInfo $hw
 
     $body = @{
-        ip              = $myIp
-        port            = $port
-        model           = $model
-        hostname        = $sysInfo.hostname
-        cpu_name        = $sysInfo.cpu_name
-        cpu_cores       = $sysInfo.cpu_cores
-        ram_total_gb    = $sysInfo.ram_total_gb
-        ram_free_gb     = $sysInfo.ram_free_gb
-        gpu_name        = $sysInfo.gpu_name
-        gpu_vram_gb     = $sysInfo.gpu_vram_gb
-        ollama_version  = $sysInfo.ollama_version
-        os_version      = $sysInfo.os_version
+        ip             = $myIp
+        port           = $port
+        model          = $model
+        hostname       = $sysInfo.hostname
+        cpu_name       = $sysInfo.cpu_name
+        cpu_cores      = $sysInfo.cpu_cores
+        ram_total_gb   = $sysInfo.ram_total_gb
+        ram_free_gb    = $sysInfo.ram_free_gb
+        gpu_name       = $sysInfo.gpu_name
+        gpu_vram_gb    = $sysInfo.gpu_vram_gb
+        ollama_version = $sysInfo.ollama_version
+        os_version     = $sysInfo.os_version
     } | ConvertTo-Json
 
-    $headers = @{ "X-API-Key" = $ApiKey }
-
-    Write-Step "Registering $myIp`:$port with coordinator at $coordinator ..."
-    $response = Invoke-RestMethod -Uri "$coordinator/register" `
-        -Method Post `
-        -Body $body `
-        -ContentType "application/json" `
-        -Headers $headers `
-        -ErrorAction Stop
-
-    Write-Ok "Registered! Coordinator response: $($response | ConvertTo-Json -Compress)"
+    $headers = @{ "X-API-Key" = $apiKey }
+    Write-Step "Registering $myIp`:$port with $coordinator ..."
+    $resp = Invoke-RestMethod -Uri "$coordinator/register" `
+        -Method Post -Body $body -ContentType "application/json" `
+        -Headers $headers -ErrorAction Stop
+    Write-Ok "Registered. Total machines: $($resp.machines_total)"
     return $myIp
 }
 
-function Start-HeartbeatLoop([string]$coordinator, [string]$apiKey, [string]$ip, [int]$port, [int]$intervalSec = 15) {
+function Start-HeartbeatLoop([string]$coordinator, [string]$apiKey, [string]$ip, [int]$port) {
     $headers = @{ "X-API-Key" = $apiKey }
-    Write-Step "Starting heartbeat loop (every ${intervalSec}s). Press Ctrl+C to stop."
+    Write-Step "Running — heartbeat every 15s. Press Ctrl+C to disconnect."
     while ($true) {
         try {
             $body = @{ ip = $ip; port = $port } | ConvertTo-Json
@@ -236,18 +254,87 @@ function Start-HeartbeatLoop([string]$coordinator, [string]$apiKey, [string]$ip,
                 -Method Post -Body $body -ContentType "application/json" `
                 -Headers $headers | Out-Null
         } catch {
-            Write-Err "Heartbeat failed: $_  (coordinator may be down)"
+            Write-Err "Heartbeat failed: $_ (coordinator unreachable)"
         }
-        Start-Sleep $intervalSec
+        Start-Sleep 15
     }
 }
 
-# ── main ─────────────────────────────────────────────────────────────────────
+# ── interactive wizard ────────────────────────────────────────────────────────
 
-Write-Host ""
-Write-Host "  swarm-llm agent  |  model: $Model  |  coordinator: $Coordinator" -ForegroundColor Yellow
-Write-Host "  TLS: ON  |  API key auth: ON  |  GPU: RTX 4070 (12 GB) detected" -ForegroundColor DarkYellow
-Write-Host ""
+function Start-Wizard {
+    Show-Banner
+
+    Write-Host "  Detecting hardware..." -ForegroundColor DarkCyan
+    $hw = Get-HardwareQuick
+
+    # Show detected specs
+    Write-Host ""
+    Write-Host "  Detected hardware:" -ForegroundColor Yellow
+    Write-Host "    CPU  : $($hw.cpu_name)"
+    Write-Host "    RAM  : $($hw.ram_gb) GB"
+    if ($hw.vram_gb -gt 0) {
+        Write-Host "    GPU  : $($hw.gpu_name) ($($hw.vram_gb) GB VRAM)" -ForegroundColor Green
+    } else {
+        Write-Host "    GPU  : none detected  (CPU inference)" -ForegroundColor DarkYellow
+    }
+    Write-Host ""
+
+    # Model selection
+    $models = @(
+        "qwen2.5-coder:0.5b  (~400 MB)  CPU-safe, for testing only",
+        "qwen2.5-coder:1.5b  (~1.0 GB)  CPU-safe, fast",
+        "qwen2.5-coder:3b    (~2.0 GB)  CPU / 4+ GB VRAM",
+        "qwen2.5-coder:7b    (~4.7 GB)  6+ GB VRAM",
+        "qwen2.5-coder:14b   (~9.0 GB)  8+ GB VRAM  ★ best quality",
+        "deepseek-r1:14b     (~9.0 GB)  8+ GB VRAM  + reasoning"
+    )
+    $modelIds = @(
+        "qwen2.5-coder:0.5b",
+        "qwen2.5-coder:1.5b",
+        "qwen2.5-coder:3b",
+        "qwen2.5-coder:7b",
+        "qwen2.5-coder:14b",
+        "deepseek-r1:14b"
+    )
+    $recIdx = Get-RecommendedModelIndex $hw.vram_gb
+
+    # Mark recommended
+    $models[$recIdx] = $models[$recIdx] + "  ← recommended"
+
+    $chosen = Show-ChoiceList "Select model:" $models $recIdx
+    $chosenId = $modelIds[$models.IndexOf($chosen)]
+
+    # Coordinator URL
+    Write-Host ""
+    Write-Host "  Coordinator URL (e.g. https://1.2.3.4:8443): " -NoNewline -ForegroundColor Yellow
+    $coordUrl = Read-Host
+    $coordUrl = $coordUrl.Trim().TrimEnd("/")
+
+    # API key (masked)
+    $apiKey = Read-MaskedInput "API Key: "
+
+    Write-Host ""
+    return @{ Model = $chosenId; Coordinator = $coordUrl; ApiKey = $apiKey; Hw = $hw }
+}
+
+# ── main ──────────────────────────────────────────────────────────────────────
+
+# If any required param is missing, run the wizard
+$interactive = ($Coordinator -eq "" -or $ApiKey -eq "" -or $Model -eq "")
+
+if ($interactive) {
+    $cfg = Start-Wizard
+    $Coordinator = $cfg.Coordinator
+    $ApiKey      = $cfg.ApiKey
+    $Model       = $cfg.Model
+    $hw          = $cfg.Hw
+} else {
+    $hw = Get-HardwareQuick
+    Show-Banner
+    Write-Host "  Model: $Model  |  Coordinator: $Coordinator" -ForegroundColor Yellow
+    Write-Host ""
+}
 
 # 1. Ensure Ollama is present
 $ollamaExe = Get-OllamaPath
@@ -257,45 +344,37 @@ if (-not $ollamaExe) {
     Write-Ok "Ollama found at: $ollamaExe"
 }
 
-# 2. Stop any existing Ollama server on this port (from a previous run this session)
+# 2. Kill any existing Ollama on this port
 $existing = Get-NetTCPConnection -LocalPort $OllamaPort -State Listen -ErrorAction SilentlyContinue
 if ($existing) {
-    Write-Step "Port $OllamaPort already in use — stopping existing Ollama process..."
-    $pid = (Get-Process -Id (
-        Get-NetTCPConnection -LocalPort $OllamaPort -State Listen
-    ).OwningProcess -ErrorAction SilentlyContinue).Id
-    if ($pid) { Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue }
+    Write-Step "Stopping existing Ollama on port $OllamaPort ..."
+    $ownPid = (Get-NetTCPConnection -LocalPort $OllamaPort -State Listen).OwningProcess
+    if ($ownPid) { Stop-Process -Id $ownPid -Force -ErrorAction SilentlyContinue }
     Start-Sleep 2
 }
 
-# 3. Start ollama serve (binding to all interfaces so the coordinator can reach it)
+# 3. Start ollama serve (all interfaces)
 Write-Step "Starting Ollama server on 0.0.0.0:$OllamaPort ..."
 $env:OLLAMA_HOST = "0.0.0.0:$OllamaPort"
 $serverProc = Start-Process -FilePath $ollamaExe `
-    -ArgumentList "serve" `
-    -PassThru `
-    -WindowStyle Hidden
+    -ArgumentList "serve" -PassThru -WindowStyle Hidden
 
 Write-Step "Waiting for Ollama to be ready..."
-if (-not (Wait-OllamaReady $ollamaExe $OllamaPort 60)) {
-    throw "Ollama server did not become ready within 60 seconds"
+if (-not (Wait-OllamaReady $OllamaPort 60)) {
+    throw "Ollama did not start within 60 seconds"
 }
-Write-Ok "Ollama server is up (PID $($serverProc.Id))"
+Write-Ok "Ollama up (PID $($serverProc.Id))"
 
-# 4. Pull model (fast no-op if already cached)
+# 4. Pull model
 if (-not $SkipModelPull) {
-    Write-Step "Pulling model '$Model' (instant if already cached, otherwise downloading)..."
+    Write-Step "Pulling '$Model' (instant if already cached)..."
     & $ollamaExe pull $Model
-    if ($LASTEXITCODE -ne 0) {
-        throw "Failed to pull model '$Model'"
-    }
-    Write-Ok "Model '$Model' ready."
-} else {
-    Write-Ok "Skipping model pull (-SkipModelPull set)."
+    if ($LASTEXITCODE -ne 0) { throw "Failed to pull model '$Model'" }
+    Write-Ok "Model ready."
 }
 
-# 5. Register with coordinator
-$myIp = Register-WithCoordinator $Coordinator $OllamaPort $Model
+# 5. Register
+$myIp = Register-WithCoordinator $Coordinator $ApiKey $OllamaPort $Model $hw
 
-# 6. Heartbeat loop (keeps this terminal open; kill to deregister)
-Start-HeartbeatLoop $Coordinator $ApiKey $myIp $OllamaPort 15
+# 6. Heartbeat (keeps terminal open)
+Start-HeartbeatLoop $Coordinator $ApiKey $myIp $OllamaPort
