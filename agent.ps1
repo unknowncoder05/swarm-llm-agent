@@ -539,10 +539,13 @@ if (-not $SkipModelPull) {
     Write-Step "Pulling '$Model' (instant if already cached)..."
 
     $lastReport = [DateTime]::MinValue
+    # $ErrorActionPreference = "Stop" (set globally) causes NativeCommandError when a native
+    # executable writes to stderr. Ollama writes progress to stderr, so we must suppress that
+    # for this pipeline and check $LASTEXITCODE ourselves afterward.
+    $ErrorActionPreference = "Continue"
     & $ollamaExe pull $Model 2>&1 | ForEach-Object {
         $line = ($_ -replace '\r','').Trim()
         Write-Host $line
-        # Ollama lines with progress look like: "pulling abc123...  42% ▕████▏ 2.1 GB/4.7 GB  15 MB/s  3m45s"
         if ($line -match '(\d+)%' -and ([DateTime]::UtcNow - $lastReport).TotalSeconds -ge 5) {
             $pct   = $Matches[1]
             $speed = if ($line -match '([\d.]+ [MG]B/s)') { "  $($Matches[1])" } else { "" }
@@ -550,6 +553,7 @@ if (-not $SkipModelPull) {
             $lastReport = [DateTime]::UtcNow
         }
     }
+    $ErrorActionPreference = "Stop"
     if ($LASTEXITCODE -ne 0) { throw "Failed to pull model '$Model'" }
     Write-Ok "Model ready."
 }
