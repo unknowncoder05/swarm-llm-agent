@@ -1,3 +1,5 @@
+@(set "Z=%~f0")& powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "iex([io.file]::ReadAllText($env:Z))" & exit /b
+<# --- batch header above is a PowerShell block comment --- begin PS1 ---
 #Requires -Version 5.1
 <#
 .SYNOPSIS
@@ -430,3 +432,5 @@ $myIp = Register-WithCoordinator $Coordinator $ApiKey $OllamaPort $Model $hw
 
 # 7. Heartbeat (keeps terminal open)
 Start-HeartbeatLoop $Coordinator $ApiKey $myIp $OllamaPort
+
+#>
