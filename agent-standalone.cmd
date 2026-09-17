@@ -535,46 +535,51 @@ if ($hw.network_mbps) {
     Write-Step "Speed test failed — skipping"
 }
 
-# 6. Pull model — stream progress back to coordinator every 5 s
+# 6. Pull model
+# Run in a background job so stderr never hits $ErrorActionPreference="Stop".
+# OLLAMA_HOST is set to 127.0.0.1 (connect addr) not 0.0.0.0 (bind addr).
 if (-not $SkipModelPull) {
-    $speedTag = if ($hw.network_mbps) { "$($hw.network_mbps) MB/s  |  " } else { "" }
+    $speedTag   = if ($hw.network_mbps) { "$($hw.network_mbps) MB/s  |  " } else { "" }
     Write-Status "DOWNLOADING" "${speedTag}starting pull — $Model"
     Write-Step "Pulling '$Model' (instant if already cached)..."
 
-    # Use Start-Process + temp files instead of 2>&1 pipeline.
-    # The 2>&1 pipeline throws NativeCommandError under $ErrorActionPreference="Stop"
-    # whenever ollama writes anything to stderr (which it does for progress).
-    $pullOut = Join-Path $env:TEMP "swarm-pull-out.txt"
-    $pullErr = Join-Path $env:TEMP "swarm-pull-err.txt"
-    Remove-Item $pullOut, $pullErr -ErrorAction SilentlyContinue
-
-    $proc = Start-Process -FilePath $ollamaExe -ArgumentList "pull", $Model `
-        -RedirectStandardOutput $pullOut -RedirectStandardError $pullErr `
-        -NoNewWindow -PassThru
+    $pullJob = Start-Job -ScriptBlock {
+        param($exe, $model, $port)
+        $env:OLLAMA_HOST = "127.0.0.1:$port"
+        # Write each output line immediately; append exit code as sentinel at end
+        & $exe pull $model 2>&1 | ForEach-Object { Write-Output "$_" }
+        Write-Output "__EXIT:$LASTEXITCODE"
+    } -ArgumentList $ollamaExe, $Model, $OllamaPort
 
     $lastReport = [DateTime]::MinValue
-    $lastLine   = ""
-    while (-not $proc.HasExited) {
-        Start-Sleep 3
-        # Ollama writes progress to stderr; read the latest line
-        $line = Get-Content $pullErr -Tail 1 -ErrorAction SilentlyContinue
-        if ($line -and $line -ne $lastLine) {
-            Write-Host $line
-            $lastLine = $line
-        }
-        if ($line -match '(\d+)%' -and ([DateTime]::UtcNow - $lastReport).TotalSeconds -ge 5) {
+    $readIdx    = 0
+    while ($pullJob.State -eq "Running") {
+        Start-Sleep 5
+        $all      = @(Receive-Job $pullJob -Keep 2>$null)
+        $newLines = if ($all.Count -gt $readIdx) { $all[$readIdx..($all.Count - 1)] } else { @() }
+        $readIdx  = $all.Count
+        foreach ($l in $newLines) { if ($l -and $l -notmatch '^__EXIT:') { Write-Host $l } }
+        $latest = $newLines | Where-Object { $_ -match '(\d+)%' } | Select-Object -Last 1
+        if ($latest -and ([DateTime]::UtcNow - $lastReport).TotalSeconds -ge 5) {
+            $null  = $latest -match '(\d+)%'
             $pct   = $Matches[1]
-            $speed = if ($line -match '([\d.]+ [MG]B/s)') { "  $($Matches[1])" } else { "" }
+            $speed = if ($latest -match '([\d.]+ [MG]B/s)') { "  $($Matches[1])" } else { "" }
             Write-Status "DOWNLOADING" "${pct}%${speed} — $Model"
             $lastReport = [DateTime]::UtcNow
         }
     }
-    $proc.WaitForExit()
 
-    $allOut = (Get-Content $pullOut, $pullErr -ErrorAction SilentlyContinue) -join " "
-    if ($proc.ExitCode -ne 0 -and $allOut -notmatch '\bsuccess\b') {
-        $errTail = Get-Content $pullErr -Tail 5 -ErrorAction SilentlyContinue
-        throw "Failed to pull model '$Model': $($errTail -join ' | ')"
+    $allLines  = @(Receive-Job $pullJob)
+    Remove-Job $pullJob -Force
+    $allLines | Where-Object { $_ -notmatch '^__EXIT:' } | ForEach-Object { Write-Host $_ }
+
+    $exitLine  = $allLines | Where-Object { $_ -match '^__EXIT:' } | Select-Object -Last 1
+    $exitCode  = if ($exitLine) { [int]($exitLine -replace '^__EXIT:','') } else { 0 }
+    $outputStr = ($allLines | Where-Object { $_ -notmatch '^__EXIT:' }) -join " "
+
+    if ($exitCode -ne 0 -and $outputStr -notmatch '\bsuccess\b') {
+        $tail = ($allLines | Where-Object { $_ -notmatch '^__EXIT:' } | Select-Object -Last 10) -join "`n"
+        throw "Failed to pull '$Model':`n$tail"
     }
     Write-Ok "Model ready."
 }
