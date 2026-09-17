@@ -384,14 +384,21 @@ function Start-WorkLoop([string]$coordinator, [string]$apiKey, [string]$ip, [int
 
     Write-Status "RUNNING" "polling for jobs every 2s — Ctrl+C to quit"
     while ($true) {
-        # heartbeat every 15s
+        # heartbeat every 15s — re-register automatically if coordinator restarted
         if (([DateTime]::UtcNow - $lastHB).TotalSeconds -ge 15) {
             try {
-                Invoke-RestMethod -Uri "$coordinator/heartbeat" -Method Post `
+                $hbResp = Invoke-WebRequest -Uri "$coordinator/heartbeat" -Method Post `
                     -Body (@{ port = $port } | ConvertTo-Json) `
                     -ContentType "application/json" `
-                    -Headers $headers -ErrorAction SilentlyContinue | Out-Null
-            } catch { }
+                    -Headers $headers -UseBasicParsing -ErrorAction Stop
+            } catch {
+                $status = if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode } else { 0 }
+                if ($status -eq 404) {
+                    # coordinator restarted — re-register
+                    Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Coordinator restarted, re-registering..." -ForegroundColor Yellow
+                    try { Register-WithCoordinator $coordinator $apiKey $port $model $script:hw } catch { }
+                }
+            }
             $lastHB = [DateTime]::UtcNow
         }
 
@@ -630,6 +637,7 @@ if (-not $SkipModelPull) {
 # 7. Register
 Write-Status "REGISTERING" ""
 $myIp = Register-WithCoordinator $Coordinator $ApiKey $OllamaPort $Model $hw
+$script:hw = $hw  # make available to work loop for re-registration
 
 # 8. Work loop — polls coordinator for jobs, runs inference locally, posts results
 Start-WorkLoop $Coordinator $ApiKey $myIp $OllamaPort $Model
