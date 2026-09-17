@@ -142,10 +142,11 @@ function Get-HardwareQuick {
 
 # Pick recommended model index based on VRAM
 function Get-RecommendedModelIndex([double]$vramGb) {
-    if     ($vramGb -ge 12) { return 4 }  # 14b
-    elseif ($vramGb -ge 6)  { return 3 }  # 7b
-    elseif ($vramGb -ge 3)  { return 2 }  # 3b
-    elseif ($vramGb -ge 1)  { return 1 }  # 1.5b
+    if     ($vramGb -ge 12) { return 6 }  # qwen3:14b  — best tool-use, fits in 12 GB
+    elseif ($vramGb -ge 6)  { return 5 }  # qwen3:8b
+    elseif ($vramGb -ge 4)  { return 3 }  # qwen2.5-coder:7b
+    elseif ($vramGb -ge 3)  { return 2 }  # qwen2.5-coder:3b
+    elseif ($vramGb -ge 1)  { return 1 }  # qwen2.5-coder:1.5b
     else                    { return 0 }  # 0.5b (CPU / unknown)
 }
 
@@ -466,12 +467,15 @@ function Start-Wizard {
 
     # Model selection
     $models = @(
-        "qwen2.5-coder:0.5b  (~400 MB)  CPU-safe, for testing only",
+        "qwen2.5-coder:0.5b  (~400 MB)  CPU-safe, testing only",
         "qwen2.5-coder:1.5b  (~1.0 GB)  CPU-safe, fast",
         "qwen2.5-coder:3b    (~2.0 GB)  CPU / 4+ GB VRAM",
-        "qwen2.5-coder:7b    (~4.7 GB)  6+ GB VRAM",
-        "qwen2.5-coder:14b   (~9.0 GB)  8+ GB VRAM  ★ best quality",
-        "deepseek-r1:14b     (~9.0 GB)  8+ GB VRAM  + reasoning"
+        "qwen2.5-coder:7b    (~4.7 GB)  6+ GB VRAM  code completion",
+        "qwen2.5-coder:14b   (~9.0 GB)  8+ GB VRAM  code completion",
+        "qwen3:8b            (~5.2 GB)  6+ GB VRAM  ★ tool-use / agents",
+        "qwen3:14b           (~9.3 GB)  10+ GB VRAM ★ best tool-use / agents",
+        "qwen3:30b-a3b       (~17 GB)   16+ GB RAM  MoE, top quality",
+        "deepseek-r1:14b     (~9.0 GB)  8+ GB VRAM  reasoning"
     )
     $modelIds = @(
         "qwen2.5-coder:0.5b",
@@ -479,6 +483,9 @@ function Start-Wizard {
         "qwen2.5-coder:3b",
         "qwen2.5-coder:7b",
         "qwen2.5-coder:14b",
+        "qwen3:8b",
+        "qwen3:14b",
+        "qwen3:30b-a3b",
         "deepseek-r1:14b"
     )
     $recIdx = Get-RecommendedModelIndex $hw.vram_gb
