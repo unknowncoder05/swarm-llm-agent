@@ -1,5 +1,6 @@
-@(set "Z=%~f0")& powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "iex([io.file]::ReadAllText($env:Z))" & exit /b
-<# --- batch header above is a PowerShell block comment --- begin PS1 ---
+@(set "Z=%~f0")& powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "iex([io.file]::ReadAllText(
+v:Z))" & exit /b
+<# --- batch header above is a PowerShell block comment ---
 #Requires -Version 5.1
 <#
 .SYNOPSIS
@@ -98,8 +99,28 @@ function Read-MaskedInput([string]$prompt) {
 
 # ── hardware detection ────────────────────────────────────────────────────────
 
+function Measure-NetworkSpeed {
+    # Downloads 5 MB from Cloudflare's speed test endpoint; returns MB/s or $null
+    $testUrl = "https://speed.cloudflare.com/__down?bytes=5242880"
+    $tmpFile = [System.IO.Path]::GetTempFileName()
+    try {
+        $wc = New-Object System.Net.WebClient
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $wc.DownloadFile($testUrl, $tmpFile)
+        $sw.Stop()
+        $bytes = (Get-Item $tmpFile).Length
+        if ($sw.Elapsed.TotalSeconds -gt 0 -and $bytes -gt 0) {
+            return [math]::Round($bytes / $sw.Elapsed.TotalSeconds / 1MB, 2)
+        }
+    } catch { }
+    finally {
+        Remove-Item $tmpFile -ErrorAction SilentlyContinue
+    }
+    return $null
+}
+
 function Get-HardwareQuick {
-    $hw = @{ vram_gb = 0; ram_gb = 0; gpu_name = "none"; cpu_name = "unknown" }
+    $hw = @{ vram_gb = 0; ram_gb = 0; gpu_name = "none"; cpu_name = "unknown"; network_mbps = $null }
     try {
         $smi = nvidia-smi --query-gpu=name,memory.total --format=csv,noheader,nounits 2>$null
         if ($LASTEXITCODE -eq 0 -and $smi) {
@@ -139,6 +160,7 @@ function Get-SystemInfo([hashtable]$hw) {
         ram_free_gb    = $null
         gpu_name       = if ($hw.gpu_name -ne "none") { $hw.gpu_name } else { $null }
         gpu_vram_gb    = if ($hw.vram_gb -gt 0)       { $hw.vram_gb }  else { $null }
+        network_mbps   = $hw.network_mbps
         ollama_version = "?"
         os_version     = [System.Environment]::OSVersion.VersionString
     }
@@ -232,6 +254,7 @@ function Register-WithCoordinator([string]$coordinator, [string]$apiKey, [int]$p
         ram_free_gb    = $sysInfo.ram_free_gb
         gpu_name       = $sysInfo.gpu_name
         gpu_vram_gb    = $sysInfo.gpu_vram_gb
+        network_mbps   = $sysInfo.network_mbps
         ollama_version = $sysInfo.ollama_version
         os_version     = $sysInfo.os_version
     } | ConvertTo-Json
@@ -261,11 +284,26 @@ function Test-CoordinatorReachable([string]$coordinator, [string]$apiKey) {
 }
 
 function Write-Status([string]$phase, [string]$detail = "") {
-    $ts = (Get-Date).ToString("HH:mm:ss")
+    $ts  = (Get-Date).ToString("HH:mm:ss")
     $msg = if ($detail) { "[$ts] $phase — $detail" } else { "[$ts] $phase" }
     Write-Host "  $msg" -ForegroundColor DarkCyan
-    # Also write to a local status file so external tools can poll it
     $msg | Out-File -FilePath "$env:TEMP\swarm-agent-status.txt" -Encoding UTF8
+
+    # Report to coordinator if we already have credentials
+    if ($script:Coordinator -and $script:ApiKey) {
+        try {
+            $body = @{
+                phase    = $phase
+                detail   = $detail
+                hostname = $env:COMPUTERNAME
+                model    = $script:Model
+            } | ConvertTo-Json
+            Invoke-RestMethod -Uri "$script:Coordinator/agent-status" `
+                -Method Post -Body $body -ContentType "application/json" `
+                -Headers @{ "X-API-Key" = $script:ApiKey } `
+                -ErrorAction SilentlyContinue | Out-Null
+        } catch { }  # never let status reporting crash the agent
+    }
 }
 
 function Start-HeartbeatLoop([string]$coordinator, [string]$apiKey, [string]$ip, [int]$port) {
@@ -352,6 +390,10 @@ function Start-Wizard {
     $ollamaPort = $portValues[$portChoices.IndexOf($portChosen)]
 
     Write-Host ""
+    # Expose credentials to Write-Status before returning so the first report fires
+    $script:Coordinator = $coordUrl
+    $script:ApiKey      = $apiKey
+    $script:Model       = $chosenId
     return @{
         Model       = $chosenId
         Coordinator = $coordUrl
@@ -387,10 +429,9 @@ if (-not (Test-CoordinatorReachable $Coordinator $ApiKey)) {
 }
 
 # 2. Ensure Ollama is present
-Write-Status "SETUP" "checking for Ollama"
 $ollamaExe = Get-OllamaPath
 if (-not $ollamaExe) {
-    Write-Status "SETUP" "downloading Ollama installer"
+    Write-Status "INSTALLING" "downloading Ollama"
     $ollamaExe = Install-Ollama
 } else {
     Write-Ok "Ollama found at: $ollamaExe"
@@ -406,7 +447,7 @@ if ($existing) {
 }
 
 # 4. Start ollama serve (all interfaces)
-Write-Status "SETUP" "starting Ollama server on port $OllamaPort"
+Write-Status "STARTING" "Ollama server on port $OllamaPort"
 $env:OLLAMA_HOST = "0.0.0.0:$OllamaPort"
 $serverProc = Start-Process -FilePath $ollamaExe `
     -ArgumentList "serve" -PassThru -WindowStyle Hidden
@@ -417,20 +458,42 @@ if (-not (Wait-OllamaReady $OllamaPort 60)) {
 }
 Write-Ok "Ollama up (PID $($serverProc.Id))"
 
-# 5. Pull model
+# 5. Network speed test — run before pull so coordinator stores the result
+Write-Step "Measuring network speed (5 MB test)..."
+$hw.network_mbps = Measure-NetworkSpeed
+if ($hw.network_mbps) {
+    Write-Ok "Network speed: $($hw.network_mbps) MB/s"
+} else {
+    Write-Step "Speed test failed — skipping"
+}
+
+# 6. Pull model — stream progress back to coordinator every 5 s
 if (-not $SkipModelPull) {
-    Write-Status "DOWNLOADING" "model $Model"
+    $speedTag = if ($hw.network_mbps) { "$($hw.network_mbps) MB/s  |  " } else { "" }
+    Write-Status "DOWNLOADING" "${speedTag}starting pull — $Model"
     Write-Step "Pulling '$Model' (instant if already cached)..."
-    & $ollamaExe pull $Model
+
+    $lastReport = [DateTime]::MinValue
+    & $ollamaExe pull $Model 2>&1 | ForEach-Object {
+        $line = ($_ -replace '\r','').Trim()
+        Write-Host $line
+        # Ollama lines with progress look like: "pulling abc123...  42% ▕████▏ 2.1 GB/4.7 GB  15 MB/s  3m45s"
+        if ($line -match '(\d+)%' -and ([DateTime]::UtcNow - $lastReport).TotalSeconds -ge 5) {
+            $pct   = $Matches[1]
+            $speed = if ($line -match '([\d.]+ [MG]B/s)') { "  $($Matches[1])" } else { "" }
+            Write-Status "DOWNLOADING" "${pct}%${speed} — $Model"
+            $lastReport = [DateTime]::UtcNow
+        }
+    }
     if ($LASTEXITCODE -ne 0) { throw "Failed to pull model '$Model'" }
     Write-Ok "Model ready."
 }
 
-# 6. Register
-Write-Status "REGISTERING"
+# 7. Register
+Write-Status "REGISTERING" ""
 $myIp = Register-WithCoordinator $Coordinator $ApiKey $OllamaPort $Model $hw
 
-# 7. Heartbeat (keeps terminal open)
+# 8. Heartbeat (keeps terminal open)
 Start-HeartbeatLoop $Coordinator $ApiKey $myIp $OllamaPort
 
 #>
