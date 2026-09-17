@@ -538,14 +538,27 @@ if (-not $SkipModelPull) {
     Write-Status "DOWNLOADING" "${speedTag}starting pull — $Model"
     Write-Step "Pulling '$Model' (instant if already cached)..."
 
+    # Use Start-Process + temp files instead of 2>&1 pipeline.
+    # The 2>&1 pipeline throws NativeCommandError under $ErrorActionPreference="Stop"
+    # whenever ollama writes anything to stderr (which it does for progress).
+    $pullOut = Join-Path $env:TEMP "swarm-pull-out.txt"
+    $pullErr = Join-Path $env:TEMP "swarm-pull-err.txt"
+    Remove-Item $pullOut, $pullErr -ErrorAction SilentlyContinue
+
+    $proc = Start-Process -FilePath $ollamaExe -ArgumentList "pull", $Model `
+        -RedirectStandardOutput $pullOut -RedirectStandardError $pullErr `
+        -NoNewWindow -PassThru
+
     $lastReport = [DateTime]::MinValue
-    # $ErrorActionPreference = "Stop" (set globally) causes NativeCommandError when a native
-    # executable writes to stderr. Ollama writes progress to stderr, so we must suppress that
-    # for this pipeline and check $LASTEXITCODE ourselves afterward.
-    $ErrorActionPreference = "Continue"
-    & $ollamaExe pull $Model 2>&1 | ForEach-Object {
-        $line = ($_ -replace '\r','').Trim()
-        Write-Host $line
+    $lastLine   = ""
+    while (-not $proc.HasExited) {
+        Start-Sleep 3
+        # Ollama writes progress to stderr; read the latest line
+        $line = Get-Content $pullErr -Tail 1 -ErrorAction SilentlyContinue
+        if ($line -and $line -ne $lastLine) {
+            Write-Host $line
+            $lastLine = $line
+        }
         if ($line -match '(\d+)%' -and ([DateTime]::UtcNow - $lastReport).TotalSeconds -ge 5) {
             $pct   = $Matches[1]
             $speed = if ($line -match '([\d.]+ [MG]B/s)') { "  $($Matches[1])" } else { "" }
@@ -553,8 +566,12 @@ if (-not $SkipModelPull) {
             $lastReport = [DateTime]::UtcNow
         }
     }
-    $ErrorActionPreference = "Stop"
-    if ($LASTEXITCODE -ne 0) { throw "Failed to pull model '$Model'" }
+    $proc.WaitForExit()
+
+    if ($proc.ExitCode -ne 0) {
+        $errTail = Get-Content $pullErr -Tail 5 -ErrorAction SilentlyContinue
+        throw "Failed to pull model '$Model': $($errTail -join ' | ')"
+    }
     Write-Ok "Model ready."
 }
 
