@@ -571,7 +571,8 @@ if (-not $SkipModelPull) {
     }
     $proc.WaitForExit()
 
-    if ($proc.ExitCode -ne 0) {
+    $allOut = (Get-Content $pullOut, $pullErr -ErrorAction SilentlyContinue) -join " "
+    if ($proc.ExitCode -ne 0 -and $allOut -notmatch '\bsuccess\b') {
         $errTail = Get-Content $pullErr -Tail 5 -ErrorAction SilentlyContinue
         throw "Failed to pull model '$Model': $($errTail -join ' | ')"
     }
