@@ -415,7 +415,7 @@ function Invoke-InferWithMascot([int]$port, [string]$bodyJson) {
         param($url, $body)
         try {
             $r = Invoke-WebRequest -Uri $url -Method Post -Body $body `
-                -ContentType "application/json" -TimeoutSec 300 `
+                -ContentType "application/json" -TimeoutSec 600 `
                 -UseBasicParsing -ErrorAction Stop
             return $r.Content   # raw JSON string — no PSObject serialisation
         } catch {
