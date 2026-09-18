@@ -389,6 +389,72 @@ function Write-Status([string]$phase, [string]$detail = "") {
     }
 }
 
+function Invoke-InferWithMascot([int]$port, [string]$bodyJson) {
+    $eyeFrames   = @("o . o","@ . @","o . o","> . <","o . o","^ . ^","o . o","* . *")
+    $mouthFrames = @(" ___ "," --- "," ~~~ "," ... "," ### ")
+    $spinners    = @("-","\","|","/")
+    $thoughts    = @(
+        "  crunching tokens   ",
+        "  hot take incoming  ",
+        "  brb, doing math    ",
+        "  yes this is fast   ",
+        "  GPU go brrrr       ",
+        "  almost there...    ",
+        "  big brain moment   "
+    )
+
+    # Run the actual HTTP call in a background job so we can animate while it runs.
+    # Returns raw JSON string to survive PS cross-runspace serialisation.
+    $inferJob = Start-Job -ScriptBlock {
+        param($url, $body)
+        try {
+            $r = Invoke-RestMethod -Uri $url -Method Post -Body $body `
+                -ContentType "application/json" -TimeoutSec 300 -ErrorAction Stop
+            return @{ ok = $true; json = ($r | ConvertTo-Json -Depth 20 -Compress) }
+        } catch {
+            return @{ ok = $false; err = "$_" }
+        }
+    } -ArgumentList "http://127.0.0.1:$port/v1/chat/completions", $bodyJson
+
+    # Reserve 5 lines for the mascot box
+    1..5 | ForEach-Object { Write-Host "" }
+    $mascotTop = [Console]::CursorTop - 5
+    [Console]::CursorVisible = $false
+
+    $frame = 0
+    $t0    = [DateTime]::UtcNow
+
+    while ($inferJob.State -eq 'Running') {
+        $elapsed = [math]::Floor(([DateTime]::UtcNow - $t0).TotalSeconds)
+        $eye     = $eyeFrames[$frame   % $eyeFrames.Count]
+        $mouth   = $mouthFrames[$frame % $mouthFrames.Count]
+        $spin    = $spinners[$frame    % $spinners.Count]
+        $think   = $thoughts[($frame / 4) % $thoughts.Count]
+
+        [Console]::SetCursorPosition(0, $mascotTop)
+        Write-Host "   .-----------.   " -ForegroundColor DarkCyan
+        Write-Host "   |  ($eye)  |   " -ForegroundColor Yellow
+        Write-Host "   |   $mouth   |   $spin  ${elapsed}s" -ForegroundColor DarkCyan
+        Write-Host "   '-----------'   " -ForegroundColor DarkCyan
+        Write-Host "  [$think]  " -ForegroundColor DarkGray
+
+        Start-Sleep -Milliseconds 150
+        $frame++
+    }
+
+    # Clear mascot area
+    [Console]::SetCursorPosition(0, $mascotTop)
+    1..5 | ForEach-Object { Write-Host ("".PadRight(60)) }
+    [Console]::SetCursorPosition(0, $mascotTop)
+    [Console]::CursorVisible = $true
+
+    $outcome = Receive-Job $inferJob -Wait
+    Remove-Job $inferJob -Force
+
+    if (-not $outcome.ok) { throw $outcome.err }
+    return $outcome.json | ConvertFrom-Json
+}
+
 function Start-WorkLoop([string]$coordinator, [string]$apiKey, [string]$ip, [int]$port, [string]$model) {
     $headers  = @{ "X-API-Key" = $apiKey }
     $modelEnc = [Uri]::EscapeDataString($model)
@@ -425,13 +491,11 @@ function Start-WorkLoop([string]$coordinator, [string]$apiKey, [string]$ip, [int
             $job         = $resp.Content | ConvertFrom-Json
             $jobId       = $job.id
             $jobBodyJson = $job.body | ConvertTo-Json -Depth 10
-            Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Job $jobId — inferring..." -ForegroundColor DarkCyan
+            Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Job $jobId" -ForegroundColor DarkCyan
             $t0 = [DateTime]::UtcNow
 
             try {
-                $result = Invoke-RestMethod -Uri "http://127.0.0.1:$port/v1/chat/completions" `
-                    -Method Post -Body $jobBodyJson -ContentType "application/json" `
-                    -TimeoutSec 300 -ErrorAction Stop
+                $result = Invoke-InferWithMascot -port $port -bodyJson $jobBodyJson
                 $ms = ([DateTime]::UtcNow - $t0).TotalMilliseconds
 
                 Invoke-RestMethod -Uri "$coordinator/agent/jobs/$jobId/result" `
