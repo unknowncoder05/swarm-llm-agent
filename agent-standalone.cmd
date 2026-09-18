@@ -406,16 +406,20 @@ function Invoke-InferWithMascot([int]$port, [string]$bodyJson) {
         "  big brain moment   "
     )
 
-    # Run the actual HTTP call in a background job so we can animate while it runs.
-    # Returns raw JSON string to survive PS cross-runspace serialisation.
+    # Run the HTTP call in a background job so we can animate while it waits.
+    # Use Invoke-WebRequest + return raw Content string — avoids PS hashtable
+    # serialisation bugs across job runspace boundaries (ConvertTo-Json on
+    # complex PSObjects can throw "index out of bounds" on PS 5.1).
+    # Prefix "__ERR__:" on failure so the string itself carries the signal.
     $inferJob = Start-Job -ScriptBlock {
         param($url, $body)
         try {
-            $r = Invoke-RestMethod -Uri $url -Method Post -Body $body `
-                -ContentType "application/json" -TimeoutSec 300 -ErrorAction Stop
-            return @{ ok = $true; json = ($r | ConvertTo-Json -Depth 20 -Compress) }
+            $r = Invoke-WebRequest -Uri $url -Method Post -Body $body `
+                -ContentType "application/json" -TimeoutSec 300 `
+                -UseBasicParsing -ErrorAction Stop
+            return $r.Content   # raw JSON string — no PSObject serialisation
         } catch {
-            return @{ ok = $false; err = "$_" }
+            return "__ERR__:$_"
         }
     } -ArgumentList "http://127.0.0.1:$port/v1/chat/completions", $bodyJson
 
@@ -432,7 +436,7 @@ function Invoke-InferWithMascot([int]$port, [string]$bodyJson) {
         $eye     = $eyeFrames[$frame   % $eyeFrames.Count]
         $mouth   = $mouthFrames[$frame % $mouthFrames.Count]
         $spin    = $spinners[$frame    % $spinners.Count]
-        $think   = $thoughts[($frame / 4) % $thoughts.Count]
+        $think   = $thoughts[([int]($frame / 4)) % $thoughts.Count]
 
         [Console]::SetCursorPosition(0, $mascotTop)
         Write-Host "   .-----------.   " -ForegroundColor DarkCyan
@@ -451,11 +455,11 @@ function Invoke-InferWithMascot([int]$port, [string]$bodyJson) {
     [Console]::SetCursorPosition(0, $mascotTop)
     [Console]::CursorVisible = $true
 
-    $outcome = Receive-Job $inferJob -Wait
+    $raw = Receive-Job $inferJob -Wait
     Remove-Job $inferJob -Force
 
-    if (-not $outcome.ok) { throw $outcome.err }
-    return $outcome.json | ConvertFrom-Json
+    if ($raw -like "__ERR__:*") { throw ($raw -replace "^__ERR__:","") }
+    return $raw | ConvertFrom-Json
 }
 
 function Start-WorkLoop([string]$coordinator, [string]$apiKey, [string]$ip, [int]$port, [string]$model) {
