@@ -589,7 +589,8 @@ if ($existing) {
 
 # 4. Start ollama serve (all interfaces)
 Write-Status "STARTING" "Ollama server on port $OllamaPort"
-$env:OLLAMA_HOST = "0.0.0.0:$OllamaPort"
+$env:OLLAMA_HOST            = "0.0.0.0:$OllamaPort"
+$env:OLLAMA_FLASH_ATTENTION = "1"   # ~20-40% faster inference on supported GPUs
 $serverProc = Start-Process -FilePath $ollamaExe `
     -ArgumentList "serve" -PassThru -WindowStyle Hidden
 
