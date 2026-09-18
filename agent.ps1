@@ -280,6 +280,19 @@ function Wait-OllamaReady([int]$port, [int]$timeoutSec = 60) {
 
 # ── coordinator comms ─────────────────────────────────────────────────────────
 
+function Get-AgentId {
+    # Stable UUID persisted across restarts — used as the coordinator key so
+    # machines behind the same NAT don't overwrite each other.
+    $idFile = "$env:TEMP\swarm-agent-id.txt"
+    if (Test-Path $idFile) {
+        $id = (Get-Content $idFile -Raw).Trim()
+        if ($id -match '^[0-9a-f-]{36}$') { return $id }
+    }
+    $id = [guid]::NewGuid().ToString()
+    $id | Set-Content $idFile -Encoding UTF8
+    return $id
+}
+
 function Register-WithCoordinator([string]$coordinator, [string]$apiKey, [int]$port, [string]$model, [hashtable]$hw) {
     $myIp = (
         Get-NetIPAddress -AddressFamily IPv4 |
@@ -292,6 +305,7 @@ function Register-WithCoordinator([string]$coordinator, [string]$apiKey, [int]$p
     $sysInfo = Get-SystemInfo $hw
 
     $body = @{
+        agent_id       = $script:AgentId
         port           = $port      # ip is derived server-side from the source address
         model          = $model
         hostname       = $sysInfo.hostname
@@ -332,7 +346,7 @@ function Test-CoordinatorReachable([string]$coordinator, [string]$apiKey) {
     #         time installing Ollama or pulling a model
     Write-Step "Validating API key ..."
     try {
-        $body = @{ phase = "CONNECTING"; detail = ""; hostname = $env:COMPUTERNAME; model = $script:Model } | ConvertTo-Json
+        $body = @{ phase = "CONNECTING"; detail = ""; agent_id = $script:AgentId; hostname = $env:COMPUTERNAME; model = $script:Model } | ConvertTo-Json
         Invoke-RestMethod -Uri "$coordinator/agent-status" `
             -Method Post -Body $body -ContentType "application/json" `
             -Headers @{ "X-API-Key" = $apiKey } `
@@ -363,6 +377,7 @@ function Write-Status([string]$phase, [string]$detail = "") {
             $body = @{
                 phase    = $phase
                 detail   = $detail
+                agent_id = $script:AgentId
                 hostname = $env:COMPUTERNAME
                 model    = $script:Model
             } | ConvertTo-Json
@@ -386,7 +401,7 @@ function Start-WorkLoop([string]$coordinator, [string]$apiKey, [string]$ip, [int
         if (([DateTime]::UtcNow - $lastHB).TotalSeconds -ge 15) {
             try {
                 $hbResp = Invoke-WebRequest -Uri "$coordinator/heartbeat" -Method Post `
-                    -Body (@{ port = $port } | ConvertTo-Json) `
+                    -Body (@{ port = $port; agent_id = $script:AgentId } | ConvertTo-Json) `
                     -ContentType "application/json" `
                     -Headers $headers -UseBasicParsing -ErrorAction Stop
             } catch {
@@ -529,6 +544,10 @@ function Start-Wizard {
 
 # ── main ──────────────────────────────────────────────────────────────────────
 
+# Stable UUID — generated once, persisted across restarts, unique per machine
+# even if multiple machines share the same hostname or NAT IP.
+$script:AgentId = Get-AgentId
+
 # If any required param is missing, run the wizard
 $interactive = ($Coordinator -eq "" -or $ApiKey -eq "" -or $Model -eq "")
 
@@ -639,9 +658,9 @@ if (-not $SkipModelPull) {
 }
 
 # 7. Register
+$script:hw = $hw   # make available to work loop for re-registration
 Write-Status "REGISTERING" ""
 $myIp = Register-WithCoordinator $Coordinator $ApiKey $OllamaPort $Model $hw
-$script:hw = $hw  # make available to work loop for re-registration
 
 # 8. Work loop — polls coordinator for jobs, runs inference locally, posts results
 Start-WorkLoop $Coordinator $ApiKey $myIp $OllamaPort $Model
