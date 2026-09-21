@@ -468,7 +468,7 @@ function Invoke-InferWithMascot([int]$port, [string]$bodyJson) {
         } catch {
             return "__ERR__:$_"
         }
-    } -ArgumentList "http://127.0.0.1:$port/v1/chat/completions", $bodyJson
+    } -ArgumentList "http://127.0.0.1:$port/api/chat", $bodyJson
 
     # Reserve 5 lines for the mascot box
     1..5 | ForEach-Object { Write-Host "" }
