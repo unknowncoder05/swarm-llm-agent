@@ -577,10 +577,34 @@ function Start-WorkLoop([string]$coordinator, [string]$apiKey, [string]$ip, [int
             $lastHB = [DateTime]::UtcNow
         }
 
-        # Poll each candidate model in order; serve the first job found
+        # For each candidate: peek first so we can download before consuming the job.
+        # This prevents holding the coordinator's job slot open during a long download.
         $servedJob = $false
         foreach ($model in $modelCandidates) {
             $modelEnc = [Uri]::EscapeDataString($model)
+
+            # Step 1: if model isn't local yet, peek to see if demand exists before downloading
+            if (-not $pulledModels.ContainsKey($model)) {
+                try {
+                    $peekResp = Invoke-WebRequest -Uri "$coordinator/agent/jobs/peek?model=$modelEnc" `
+                        -Method Get -Headers $headers -UseBasicParsing -ErrorAction Stop
+                    if ($peekResp.StatusCode -ne 200) { continue }  # no demand — skip
+                } catch { continue }
+
+                # Demand exists — download before consuming any job
+                Write-Status "DOWNLOADING" "demand detected — pulling $model"
+                try {
+                    Invoke-ModelPull $model $port
+                    $pulledModels[$model] = $true
+                    $script:Model = $model
+                    try { Register-WithCoordinator $coordinator $apiKey $port $model $script:hw } catch { }
+                } catch {
+                    Write-Err "Pull failed for $model`: $_"
+                    continue
+                }
+            }
+
+            # Step 2: model is local — consume and serve the job
             try {
                 $resp = Invoke-WebRequest -Uri "$coordinator/agent/jobs/next?model=$modelEnc" `
                     -Method Get -Headers $headers -UseBasicParsing -ErrorAction Stop
@@ -591,34 +615,10 @@ function Start-WorkLoop([string]$coordinator, [string]$apiKey, [string]$ip, [int
                 $jobBodyJson = $job.body | ConvertTo-Json -Depth 10
                 Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Job $jobId  model=$model" -ForegroundColor DarkCyan
 
-                # Pull on demand if this model hasn't been confirmed local yet
-                if (-not $pulledModels.ContainsKey($model)) {
-                    Write-Status "DOWNLOADING" "on-demand pull — $model"
-                    try {
-                        Invoke-ModelPull $model $port
-                        $pulledModels[$model] = $true
-                        # Update registered model so dashboard reflects what's loaded
-                        $script:Model = $model
-                        try { Register-WithCoordinator $coordinator $apiKey $port $model $script:hw } catch { }
-                    } catch {
-                        Write-Err "Pull failed for $model — returning job to queue"
-                        # Return job with error so the consumer gets a response
-                        try {
-                            Invoke-RestMethod -Uri "$coordinator/agent/jobs/$jobId/result" `
-                                -Method Post -ContentType "application/json" `
-                                -Body (@{ error = "on-demand pull failed: $_" } | ConvertTo-Json) `
-                                -Headers $headers -ErrorAction SilentlyContinue | Out-Null
-                        } catch { }
-                        continue
-                    }
-                }
-
                 $t0 = [DateTime]::UtcNow
                 try {
                     $rawResult = Invoke-InferWithMascot -port $port -bodyJson $jobBodyJson
                     $ms        = [math]::Round(([DateTime]::UtcNow - $t0).TotalMilliseconds, 1)
-                    # Embed the raw Ollama JSON directly — avoids double-parse/re-serialize
-                    # which breaks on escape sequences PS 5.1 rejects (e.g. backslash-space)
                     $postBody  = "{`"result`":$rawResult,`"elapsed_ms`":$ms}"
                     Invoke-RestMethod -Uri "$coordinator/agent/jobs/$jobId/result" `
                         -Method Post -ContentType "application/json" `
@@ -637,9 +637,9 @@ function Start-WorkLoop([string]$coordinator, [string]$apiKey, [string]$ip, [int
                 }
 
                 $servedJob = $true
-                break  # one job per poll cycle
+                break
             } catch {
-                # poll error — silently skip this model
+                # poll error — silently skip
             }
         }
 
