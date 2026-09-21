@@ -180,6 +180,31 @@ function Get-SystemInfo([hashtable]$hw) {
 
 # ── ollama helpers ────────────────────────────────────────────────────────────
 
+# How many concurrent requests Ollama should handle for a given model + VRAM.
+# LLM inference is memory-bandwidth bound: a single request leaves ~50% GPU idle.
+# Parallel slots let multiple agentic sessions share the same loaded weights.
+# Uses 4 GB/slot as a conservative budget (actual KV cache with q8_0 is ~half that).
+function Get-OllamaParallel([double]$vramGb, [string]$model) {
+    if ($vramGb -le 0) { return 1 }  # CPU inference — no benefit from parallelism
+    $modelVram = switch -Wildcard ($model) {
+        "devstral:24b"        { 15 }
+        "qwen3:30b*"          { 17 }
+        "qwen3:14b"           { 9  }
+        "qwen2.5-coder:14b"   { 9  }
+        "deepseek-r1:14b"     { 9  }
+        "qwen3:8b"            { 5  }
+        "devstral:7b"         { 5  }
+        "qwen2.5-coder:7b"    { 5  }
+        "qwen2.5-coder:3b"    { 2  }
+        "qwen2.5-coder:1.5b"  { 1  }
+        "qwen2.5-coder:0.5b"  { 1  }
+        default               { [math]::Ceiling($vramGb * 0.65) }
+    }
+    # Headroom after weights and 2 GB driver/OS overhead
+    $freeVram = $vramGb - $modelVram - 2
+    return [math]::Max(1, [math]::Min(4, 1 + [int][math]::Floor($freeVram / 4)))
+}
+
 function Get-OllamaPath {
     $found = Get-Command ollama -ErrorAction SilentlyContinue
     if ($found) { return $found.Source }
@@ -663,7 +688,11 @@ if ($existing) {
 # 4. Start ollama serve (all interfaces)
 Write-Status "STARTING" "Ollama server on port $OllamaPort"
 $env:OLLAMA_HOST            = "0.0.0.0:$OllamaPort"
-$env:OLLAMA_FLASH_ATTENTION = "1"   # ~20-40% faster inference on supported GPUs
+$env:OLLAMA_FLASH_ATTENTION = "1"              # ~20-40% faster on supported GPUs
+$env:OLLAMA_KV_CACHE_TYPE   = "q8_0"          # quantize KV cache: ~50% less VRAM, no quality loss
+$ollamaParallel = Get-OllamaParallel $hw.vram_gb $Model
+$env:OLLAMA_NUM_PARALLEL    = "$ollamaParallel"  # concurrent requests sharing loaded weights
+Write-Step "Parallel slots: $ollamaParallel (VRAM: $($hw.vram_gb) GB, model: $Model)"
 $serverProc = Start-Process -FilePath $ollamaExe `
     -ArgumentList "serve" -PassThru -WindowStyle Hidden
 
