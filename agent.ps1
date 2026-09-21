@@ -148,6 +148,27 @@ function Get-RecommendedModelIndex([double]$vramGb) {
     else                    { return 0 }  # 0.5b (CPU / unknown)
 }
 
+# All model IDs this machine can serve given its VRAM.
+# CPU-only machines (vramGb=0) accept small models that run on RAM.
+function Get-ModelCandidates([double]$vramGb) {
+    $catalog = @(
+        @{ id="qwen2.5-coder:0.5b";    vram=0.4  },
+        @{ id="qwen2.5-coder:1.5b";    vram=1.0  },
+        @{ id="qwen2.5-coder:3b";      vram=2.0  },
+        @{ id="qwen2.5-coder:7b";      vram=4.7  },
+        @{ id="qwen2.5-coder:14b";     vram=9.0  },
+        @{ id="ministral-3:8b";        vram=5.2  },
+        @{ id="qwen3:8b";              vram=5.2  },
+        @{ id="qwen3:14b";             vram=9.3  },
+        @{ id="devstral-small-2:24b";  vram=15.0 },
+        @{ id="devstral:24b";          vram=15.0 },
+        @{ id="qwen3:30b-a3b";         vram=17.0 },
+        @{ id="deepseek-r1:14b";       vram=9.0  }
+    )
+    $limit = if ($vramGb -le 0) { 8.0 } else { $vramGb - 1.0 }
+    return @($catalog | Where-Object { $_.vram -le $limit } | ForEach-Object { $_.id })
+}
+
 # ── system info (full, for registration) ──────────────────────────────────────
 
 function Get-SystemInfo([hashtable]$hw) {
@@ -486,69 +507,138 @@ function Invoke-InferWithMascot([int]$port, [string]$bodyJson) {
     return $raw | ConvertFrom-Json
 }
 
-function Start-WorkLoop([string]$coordinator, [string]$apiKey, [string]$ip, [int]$port, [string]$model) {
-    $headers  = @{ "X-API-Key" = $apiKey }
-    $modelEnc = [Uri]::EscapeDataString($model)
-    $pollUrl  = "$coordinator/agent/jobs/next?model=$modelEnc"
-    $lastHB   = [DateTime]::MinValue
+# Pull a model from Ollama, streaming progress to the console and coordinator.
+# Throws on failure. Safe to call at startup or on-demand from the work loop.
+function Invoke-ModelPull([string]$modelName, [int]$port) {
+    Write-Step "Pulling '$modelName' (instant if already cached)..."
+    $pullJob = Start-Job -ScriptBlock {
+        param($exe, $model, $port)
+        $env:OLLAMA_HOST = "127.0.0.1:$port"
+        & $exe pull $model 2>&1 | ForEach-Object { Write-Output "$_" }
+        Write-Output "__EXIT:$LASTEXITCODE"
+    } -ArgumentList $script:ollamaExe, $modelName, $port
 
-    Write-Status "RUNNING" "polling for jobs every 2s — Ctrl+C to quit"
+    $lastReport = [DateTime]::MinValue
+    $readIdx    = 0
+    while ($pullJob.State -eq "Running") {
+        Start-Sleep 5
+        $all      = @(Receive-Job $pullJob -Keep 2>$null)
+        $newLines = if ($all.Count -gt $readIdx) { $all[$readIdx..($all.Count - 1)] } else { @() }
+        $readIdx  = $all.Count
+        foreach ($l in $newLines) { if ($l -and $l -notmatch '^__EXIT:') { Write-Host $l } }
+        $latest = $newLines | Where-Object { $_ -match '(\d+)%' } | Select-Object -Last 1
+        if ($latest -and ([DateTime]::UtcNow - $lastReport).TotalSeconds -ge 5) {
+            $null  = $latest -match '(\d+)%'
+            $pct   = $Matches[1]
+            $speed = if ($latest -match '([\d.]+ [MG]B/s)') { "  $($Matches[1])" } else { "" }
+            Write-Status "DOWNLOADING" "${pct}%${speed} — $modelName"
+            $lastReport = [DateTime]::UtcNow
+        }
+    }
+
+    $allLines  = @(Receive-Job $pullJob)
+    Remove-Job $pullJob -Force
+    $allLines | Where-Object { $_ -notmatch '^__EXIT:' } | ForEach-Object { Write-Host $_ }
+
+    $exitLine  = $allLines | Where-Object { $_ -match '^__EXIT:' } | Select-Object -Last 1
+    $exitCode  = if ($exitLine) { [int]($exitLine -replace '^__EXIT:','') } else { 0 }
+    $outputStr = ($allLines | Where-Object { $_ -notmatch '^__EXIT:' }) -join " "
+
+    if ($exitCode -ne 0 -and $outputStr -notmatch '\bsuccess\b') {
+        $tail = ($allLines | Where-Object { $_ -notmatch '^__EXIT:' } | Select-Object -Last 10) -join "`n"
+        throw "Failed to pull '$modelName':`n$tail"
+    }
+    Write-Ok "Model '$modelName' ready."
+}
+
+function Start-WorkLoop([string]$coordinator, [string]$apiKey, [string]$ip, [int]$port, [string[]]$modelCandidates) {
+    $headers     = @{ "X-API-Key" = $apiKey }
+    $lastHB      = [DateTime]::MinValue
+    $pulledModels = @{}   # models already confirmed local — skip re-pull
+
+    Write-Status "RUNNING" "accepting jobs for $($modelCandidates.Count) models — Ctrl+C to quit"
     while ($true) {
         # heartbeat every 15s — re-register automatically if coordinator restarted
         if (([DateTime]::UtcNow - $lastHB).TotalSeconds -ge 15) {
             try {
-                $hbResp = Invoke-WebRequest -Uri "$coordinator/heartbeat" -Method Post `
+                Invoke-WebRequest -Uri "$coordinator/heartbeat" -Method Post `
                     -Body (@{ port = $port; agent_id = $script:AgentId } | ConvertTo-Json) `
                     -ContentType "application/json" `
-                    -Headers $headers -UseBasicParsing -ErrorAction Stop
+                    -Headers $headers -UseBasicParsing -ErrorAction Stop | Out-Null
             } catch {
                 $status = if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode } else { 0 }
                 if ($status -eq 404) {
-                    # coordinator restarted — re-register
                     Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Coordinator restarted, re-registering..." -ForegroundColor Yellow
-                    try { Register-WithCoordinator $coordinator $apiKey $port $model $script:hw } catch { }
+                    try { Register-WithCoordinator $coordinator $apiKey $port $script:Model $script:hw } catch { }
                 }
             }
             $lastHB = [DateTime]::UtcNow
         }
 
-        # poll for next job (204 = empty queue, 200 = job available)
-        try {
-            $resp = Invoke-WebRequest -Uri $pollUrl -Method Get `
-                -Headers $headers -UseBasicParsing -ErrorAction Stop
-
-            if ($resp.StatusCode -ne 200) { Start-Sleep 2; continue }
-
-            $job         = $resp.Content | ConvertFrom-Json
-            $jobId       = $job.id
-            $jobBodyJson = $job.body | ConvertTo-Json -Depth 10
-            Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Job $jobId" -ForegroundColor DarkCyan
-            $t0 = [DateTime]::UtcNow
-
+        # Poll each candidate model in order; serve the first job found
+        $servedJob = $false
+        foreach ($model in $modelCandidates) {
+            $modelEnc = [Uri]::EscapeDataString($model)
             try {
-                $result = Invoke-InferWithMascot -port $port -bodyJson $jobBodyJson
-                $ms = ([DateTime]::UtcNow - $t0).TotalMilliseconds
+                $resp = Invoke-WebRequest -Uri "$coordinator/agent/jobs/next?model=$modelEnc" `
+                    -Method Get -Headers $headers -UseBasicParsing -ErrorAction Stop
+                if ($resp.StatusCode -ne 200) { continue }
 
-                Invoke-RestMethod -Uri "$coordinator/agent/jobs/$jobId/result" `
-                    -Method Post -ContentType "application/json" `
-                    -Body (@{ result = $result; elapsed_ms = [math]::Round($ms, 1) } | ConvertTo-Json -Depth 20) `
-                    -Headers $headers -ErrorAction SilentlyContinue | Out-Null
-                Write-Ok "Job $jobId done in $([math]::Round($ms / 1000, 1))s"
-            } catch {
-                $err = "$_"
-                Write-Err "Job $jobId failed: $err"
+                $job         = $resp.Content | ConvertFrom-Json
+                $jobId       = $job.id
+                $jobBodyJson = $job.body | ConvertTo-Json -Depth 10
+                Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Job $jobId  model=$model" -ForegroundColor DarkCyan
+
+                # Pull on demand if this model hasn't been confirmed local yet
+                if (-not $pulledModels.ContainsKey($model)) {
+                    Write-Status "DOWNLOADING" "on-demand pull — $model"
+                    try {
+                        Invoke-ModelPull $model $port
+                        $pulledModels[$model] = $true
+                        # Update registered model so dashboard reflects what's loaded
+                        $script:Model = $model
+                        try { Register-WithCoordinator $coordinator $apiKey $port $model $script:hw } catch { }
+                    } catch {
+                        Write-Err "Pull failed for $model — returning job to queue"
+                        # Return job with error so the consumer gets a response
+                        try {
+                            Invoke-RestMethod -Uri "$coordinator/agent/jobs/$jobId/result" `
+                                -Method Post -ContentType "application/json" `
+                                -Body (@{ error = "on-demand pull failed: $_" } | ConvertTo-Json) `
+                                -Headers $headers -ErrorAction SilentlyContinue | Out-Null
+                        } catch { }
+                        continue
+                    }
+                }
+
+                $t0 = [DateTime]::UtcNow
                 try {
+                    $result = Invoke-InferWithMascot -port $port -bodyJson $jobBodyJson
+                    $ms     = ([DateTime]::UtcNow - $t0).TotalMilliseconds
                     Invoke-RestMethod -Uri "$coordinator/agent/jobs/$jobId/result" `
                         -Method Post -ContentType "application/json" `
-                        -Body (@{ error = $err } | ConvertTo-Json) `
+                        -Body (@{ result = $result; elapsed_ms = [math]::Round($ms, 1) } | ConvertTo-Json -Depth 20) `
                         -Headers $headers -ErrorAction SilentlyContinue | Out-Null
-                } catch { }
+                    Write-Ok "Job $jobId done in $([math]::Round($ms / 1000, 1))s"
+                } catch {
+                    $err = "$_"
+                    Write-Err "Job $jobId failed: $err"
+                    try {
+                        Invoke-RestMethod -Uri "$coordinator/agent/jobs/$jobId/result" `
+                            -Method Post -ContentType "application/json" `
+                            -Body (@{ error = $err } | ConvertTo-Json) `
+                            -Headers $headers -ErrorAction SilentlyContinue | Out-Null
+                    } catch { }
+                }
+
+                $servedJob = $true
+                break  # one job per poll cycle
+            } catch {
+                # poll error — silently skip this model
             }
-        } catch {
-            # real poll errors (network, auth) — silently retry
         }
 
-        Start-Sleep 2
+        if (-not $servedJob) { Start-Sleep 2 }
     }
 }
 
@@ -573,19 +663,7 @@ function Start-Wizard {
     Write-Host ""
 
     # Model selection
-    $models = @(
-        "qwen2.5-coder:0.5b    (~400 MB)  CPU-safe, testing only",
-        "qwen2.5-coder:1.5b    (~1.0 GB)  CPU-safe, fast",
-        "qwen2.5-coder:3b      (~2.0 GB)  CPU / 4+ GB VRAM",
-        "qwen2.5-coder:7b      (~4.7 GB)  6+ GB VRAM  code completion",
-        "qwen2.5-coder:14b     (~9.0 GB)  8+ GB VRAM  code completion",
-        "ministral-3:8b        (~5.2 GB)  6+ GB VRAM  ★ Mistral agentic (Dec 2025)",
-        "qwen3:8b              (~5.2 GB)  6+ GB VRAM  ★ tool-use / agents",
-        "qwen3:14b             (~9.3 GB)  10+ GB VRAM ★ tool-use / agents",
-        "devstral-small-2:24b  (~15 GB)   16+ GB VRAM ★ best agentic coding (Dec 2025)",
-        "qwen3:30b-a3b         (~17 GB)   16+ GB RAM  MoE, top quality",
-        "deepseek-r1:14b       (~9.0 GB)  8+ GB VRAM  reasoning"
-    )
+    # Auto-select default model based on VRAM (downloaded at startup; others pulled on demand)
     $modelIds = @(
         "qwen2.5-coder:0.5b",
         "qwen2.5-coder:1.5b",
@@ -599,13 +677,12 @@ function Start-Wizard {
         "qwen3:30b-a3b",
         "deepseek-r1:14b"
     )
-    $recIdx = Get-RecommendedModelIndex $hw.vram_gb
-
-    # Mark recommended
-    $models[$recIdx] = $models[$recIdx] + "  ← recommended"
-
-    $chosen = Show-ChoiceList "Select model:" $models $recIdx
-    $chosenId = $modelIds[$models.IndexOf($chosen)]
+    $recIdx   = Get-RecommendedModelIndex $hw.vram_gb
+    $chosenId = $modelIds[$recIdx]
+    Write-Host ""
+    Write-Host "  Default model  : $chosenId  (auto-selected for $($hw.vram_gb) GB VRAM)" -ForegroundColor Green
+    Write-Host "  Other models   : pulled on demand when a job requests them" -ForegroundColor DarkGray
+    Write-Host ""
 
     # Coordinator URL
     Write-Host ""
@@ -712,53 +789,12 @@ if ($hw.network_mbps) {
     Write-Step "Speed test failed — skipping"
 }
 
-# 6. Pull model
-# Run in a background job so stderr never hits $ErrorActionPreference="Stop".
-# OLLAMA_HOST is set to 127.0.0.1 (connect addr) not 0.0.0.0 (bind addr).
+# 6. Pull default model (others are pulled on demand when a job arrives)
+$script:ollamaExe = $ollamaExe   # expose to Invoke-ModelPull
 if (-not $SkipModelPull) {
-    $speedTag   = if ($hw.network_mbps) { "$($hw.network_mbps) MB/s  |  " } else { "" }
+    $speedTag = if ($hw.network_mbps) { "$($hw.network_mbps) MB/s  |  " } else { "" }
     Write-Status "DOWNLOADING" "${speedTag}starting pull — $Model"
-    Write-Step "Pulling '$Model' (instant if already cached)..."
-
-    $pullJob = Start-Job -ScriptBlock {
-        param($exe, $model, $port)
-        $env:OLLAMA_HOST = "127.0.0.1:$port"
-        # Write each output line immediately; append exit code as sentinel at end
-        & $exe pull $model 2>&1 | ForEach-Object { Write-Output "$_" }
-        Write-Output "__EXIT:$LASTEXITCODE"
-    } -ArgumentList $ollamaExe, $Model, $OllamaPort
-
-    $lastReport = [DateTime]::MinValue
-    $readIdx    = 0
-    while ($pullJob.State -eq "Running") {
-        Start-Sleep 5
-        $all      = @(Receive-Job $pullJob -Keep 2>$null)
-        $newLines = if ($all.Count -gt $readIdx) { $all[$readIdx..($all.Count - 1)] } else { @() }
-        $readIdx  = $all.Count
-        foreach ($l in $newLines) { if ($l -and $l -notmatch '^__EXIT:') { Write-Host $l } }
-        $latest = $newLines | Where-Object { $_ -match '(\d+)%' } | Select-Object -Last 1
-        if ($latest -and ([DateTime]::UtcNow - $lastReport).TotalSeconds -ge 5) {
-            $null  = $latest -match '(\d+)%'
-            $pct   = $Matches[1]
-            $speed = if ($latest -match '([\d.]+ [MG]B/s)') { "  $($Matches[1])" } else { "" }
-            Write-Status "DOWNLOADING" "${pct}%${speed} — $Model"
-            $lastReport = [DateTime]::UtcNow
-        }
-    }
-
-    $allLines  = @(Receive-Job $pullJob)
-    Remove-Job $pullJob -Force
-    $allLines | Where-Object { $_ -notmatch '^__EXIT:' } | ForEach-Object { Write-Host $_ }
-
-    $exitLine  = $allLines | Where-Object { $_ -match '^__EXIT:' } | Select-Object -Last 1
-    $exitCode  = if ($exitLine) { [int]($exitLine -replace '^__EXIT:','') } else { 0 }
-    $outputStr = ($allLines | Where-Object { $_ -notmatch '^__EXIT:' }) -join " "
-
-    if ($exitCode -ne 0 -and $outputStr -notmatch '\bsuccess\b') {
-        $tail = ($allLines | Where-Object { $_ -notmatch '^__EXIT:' } | Select-Object -Last 10) -join "`n"
-        throw "Failed to pull '$Model':`n$tail"
-    }
-    Write-Ok "Model ready."
+    Invoke-ModelPull $Model $OllamaPort
 }
 
 # 7. Register
@@ -766,5 +802,7 @@ $script:hw = $hw   # make available to work loop for re-registration
 Write-Status "REGISTERING" ""
 $myIp = Register-WithCoordinator $Coordinator $ApiKey $OllamaPort $Model $hw
 
-# 8. Work loop — polls coordinator for jobs, runs inference locally, posts results
-Start-WorkLoop $Coordinator $ApiKey $myIp $OllamaPort $Model
+# 8. Work loop — polls all models this machine can serve; pulls on demand
+$candidates = Get-ModelCandidates $hw.vram_gb
+Write-Step "Will accept jobs for: $($candidates -join ', ')"
+Start-WorkLoop $Coordinator $ApiKey $myIp $OllamaPort $candidates
