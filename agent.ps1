@@ -556,7 +556,20 @@ function Invoke-ModelPull([string]$modelName, [int]$port) {
 function Start-WorkLoop([string]$coordinator, [string]$apiKey, [string]$ip, [int]$port, [string[]]$modelCandidates) {
     $headers     = @{ "X-API-Key" = $apiKey }
     $lastHB      = [DateTime]::MinValue
-    $pulledModels = @{}   # models already confirmed local — skip re-pull
+
+    # Pre-populate from ollama list so models already on disk skip the peek/download step
+    $pulledModels = @{}
+    try {
+        $env:OLLAMA_HOST = "127.0.0.1:$port"
+        $listOut = & $script:ollamaExe list 2>&1 | Select-Object -Skip 1  # skip header row
+        foreach ($line in $listOut) {
+            $name = ($line -split '\s+')[0]  # "model:tag  ID  size  ..."
+            if ($name) { $pulledModels[$name] = $true }
+        }
+        if ($pulledModels.Count -gt 0) {
+            Write-Step "Already on disk: $($pulledModels.Keys -join ', ')"
+        }
+    } catch { }
 
     Write-Status "RUNNING" "accepting jobs for $($modelCandidates.Count) models — Ctrl+C to quit"
     while ($true) {
