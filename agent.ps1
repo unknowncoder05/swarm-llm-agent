@@ -139,9 +139,9 @@ function Get-HardwareQuick {
 
 # Pick recommended model index based on VRAM
 function Get-RecommendedModelIndex([double]$vramGb) {
-    if     ($vramGb -ge 16) { return 8 }  # devstral-small-2:24b — best agentic coding
-    elseif ($vramGb -ge 12) { return 7 }  # qwen3:14b   — best tool-use, fits in 12 GB
-    elseif ($vramGb -ge 6)  { return 5 }  # ministral-3:8b — Mistral agentic, 6+ GB
+    if     ($vramGb -ge 16) { return 9 }  # devstral-small-2:24b — best agentic coding
+    elseif ($vramGb -ge 12) { return 8 }  # qwen3:14b   — best tool-use, fits in 12 GB
+    elseif ($vramGb -ge 6)  { return 7 }  # devstral-small-2:8b — Mistral agentic coding, 6+ GB
     elseif ($vramGb -ge 4)  { return 3 }  # qwen2.5-coder:7b
     elseif ($vramGb -ge 3)  { return 2 }  # qwen2.5-coder:3b
     elseif ($vramGb -ge 1)  { return 1 }  # qwen2.5-coder:1.5b
@@ -159,6 +159,7 @@ function Get-ModelCandidates([double]$vramGb) {
         @{ id="qwen2.5-coder:14b";     vram=9.0  },
         @{ id="ministral-3:8b";        vram=5.2  },
         @{ id="qwen3:8b";              vram=5.2  },
+        @{ id="devstral-small-2:8b";   vram=5.2  },
         @{ id="qwen3:14b";             vram=9.3  },
         @{ id="devstral-small-2:24b";  vram=15.0 },
         @{ id="devstral:24b";          vram=15.0 },
@@ -210,6 +211,7 @@ function Get-OllamaParallel([double]$vramGb, [string]$model) {
     $modelVram = switch -Wildcard ($model) {
         "devstral-small-2:24b" { 15 }
         "devstral:24b"         { 15 }
+        "devstral-small-2:8b"  { 5  }
         "qwen3:30b*"           { 17 }
         "qwen3:14b"            { 9  }
         "qwen2.5-coder:14b"    { 9  }
@@ -691,6 +693,7 @@ function Start-Wizard {
         "qwen2.5-coder:14b",
         "ministral-3:8b",
         "qwen3:8b",
+        "devstral-small-2:8b",
         "qwen3:14b",
         "devstral-small-2:24b",
         "qwen3:30b-a3b",
