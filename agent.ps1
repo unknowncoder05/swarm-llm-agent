@@ -504,7 +504,9 @@ function Invoke-InferWithMascot([int]$port, [string]$bodyJson) {
     Remove-Job $inferJob -Force
 
     if ($raw -like "__ERR__:*") { throw ($raw -replace "^__ERR__:","") }
-    return $raw | ConvertFrom-Json
+    # Return the raw JSON string — avoids PS 5.1's strict ConvertFrom-Json which rejects
+    # valid-ish escape sequences (e.g. backslash-space) that some models produce in code.
+    return $raw
 }
 
 # Pull a model from Ollama, streaming progress to the console and coordinator.
@@ -613,11 +615,14 @@ function Start-WorkLoop([string]$coordinator, [string]$apiKey, [string]$ip, [int
 
                 $t0 = [DateTime]::UtcNow
                 try {
-                    $result = Invoke-InferWithMascot -port $port -bodyJson $jobBodyJson
-                    $ms     = ([DateTime]::UtcNow - $t0).TotalMilliseconds
+                    $rawResult = Invoke-InferWithMascot -port $port -bodyJson $jobBodyJson
+                    $ms        = [math]::Round(([DateTime]::UtcNow - $t0).TotalMilliseconds, 1)
+                    # Embed the raw Ollama JSON directly — avoids double-parse/re-serialize
+                    # which breaks on escape sequences PS 5.1 rejects (e.g. backslash-space)
+                    $postBody  = "{`"result`":$rawResult,`"elapsed_ms`":$ms}"
                     Invoke-RestMethod -Uri "$coordinator/agent/jobs/$jobId/result" `
                         -Method Post -ContentType "application/json" `
-                        -Body (@{ result = $result; elapsed_ms = [math]::Round($ms, 1) } | ConvertTo-Json -Depth 20) `
+                        -Body $postBody `
                         -Headers $headers -ErrorAction SilentlyContinue | Out-Null
                     Write-Ok "Job $jobId done in $([math]::Round($ms / 1000, 1))s"
                 } catch {
