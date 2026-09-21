@@ -619,7 +619,8 @@ function Start-WorkLoop([string]$coordinator, [string]$apiKey, [string]$ip, [int
 
             # Step 2: model is local — consume and serve the job
             try {
-                $resp = Invoke-WebRequest -Uri "$coordinator/agent/jobs/next?model=$modelEnc" `
+                $agentIdEnc = [System.Uri]::EscapeDataString($script:AgentId)
+                $resp = Invoke-WebRequest -Uri "$coordinator/agent/jobs/next?model=$modelEnc&agent_id=$agentIdEnc" `
                     -Method Get -Headers $headers -UseBasicParsing -ErrorAction Stop
                 if ($resp.StatusCode -ne 200) { continue }
 
