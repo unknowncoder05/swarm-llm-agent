@@ -626,7 +626,7 @@ function Start-WorkLoop([string]$coordinator, [string]$apiKey, [string]$ip, [int
 
                 $job         = $resp.Content | ConvertFrom-Json
                 $jobId       = $job.id
-                $jobBodyJson = $job.body | ConvertTo-Json -Depth 10
+                $jobBodyJson = $job.body_json   # pre-serialized by coordinator — no ConvertTo-Json needed
                 Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Job $jobId  model=$model" -ForegroundColor DarkCyan
 
                 $t0 = [DateTime]::UtcNow
