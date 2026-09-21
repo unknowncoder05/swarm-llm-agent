@@ -139,9 +139,9 @@ function Get-HardwareQuick {
 
 # Pick recommended model index based on VRAM
 function Get-RecommendedModelIndex([double]$vramGb) {
-    if     ($vramGb -ge 16) { return 7 }  # devstral:24b — purpose-built for agentic coding
-    elseif ($vramGb -ge 12) { return 6 }  # qwen3:14b   — best tool-use, fits in 12 GB
-    elseif ($vramGb -ge 6)  { return 5 }  # qwen3:8b
+    if     ($vramGb -ge 16) { return 8 }  # devstral-small-2:24b — best agentic coding
+    elseif ($vramGb -ge 12) { return 7 }  # qwen3:14b   — best tool-use, fits in 12 GB
+    elseif ($vramGb -ge 6)  { return 5 }  # ministral-3:8b — Mistral agentic, 6+ GB
     elseif ($vramGb -ge 4)  { return 3 }  # qwen2.5-coder:7b
     elseif ($vramGb -ge 3)  { return 2 }  # qwen2.5-coder:3b
     elseif ($vramGb -ge 1)  { return 1 }  # qwen2.5-coder:1.5b
@@ -187,17 +187,19 @@ function Get-SystemInfo([hashtable]$hw) {
 function Get-OllamaParallel([double]$vramGb, [string]$model) {
     if ($vramGb -le 0) { return 1 }  # CPU inference — no benefit from parallelism
     $modelVram = switch -Wildcard ($model) {
-        "devstral:24b"        { 15 }
-        "qwen3:30b*"          { 17 }
-        "qwen3:14b"           { 9  }
-        "qwen2.5-coder:14b"   { 9  }
-        "deepseek-r1:14b"     { 9  }
-        "qwen3:8b"            { 5  }
-        "qwen2.5-coder:7b"    { 5  }
-        "qwen2.5-coder:3b"    { 2  }
-        "qwen2.5-coder:1.5b"  { 1  }
-        "qwen2.5-coder:0.5b"  { 1  }
-        default               { [math]::Ceiling($vramGb * 0.65) }
+        "devstral-small-2:24b" { 15 }
+        "devstral:24b"         { 15 }
+        "qwen3:30b*"           { 17 }
+        "qwen3:14b"            { 9  }
+        "qwen2.5-coder:14b"    { 9  }
+        "deepseek-r1:14b"      { 9  }
+        "ministral-3:8b"       { 5  }
+        "qwen3:8b"             { 5  }
+        "qwen2.5-coder:7b"     { 5  }
+        "qwen2.5-coder:3b"     { 2  }
+        "qwen2.5-coder:1.5b"   { 1  }
+        "qwen2.5-coder:0.5b"   { 1  }
+        default                { [math]::Ceiling($vramGb * 0.65) }
     }
     # Headroom after weights and 2 GB driver/OS overhead
     $freeVram = $vramGb - $modelVram - 2
@@ -572,16 +574,17 @@ function Start-Wizard {
 
     # Model selection
     $models = @(
-        "qwen2.5-coder:0.5b  (~400 MB)  CPU-safe, testing only",
-        "qwen2.5-coder:1.5b  (~1.0 GB)  CPU-safe, fast",
-        "qwen2.5-coder:3b    (~2.0 GB)  CPU / 4+ GB VRAM",
-        "qwen2.5-coder:7b    (~4.7 GB)  6+ GB VRAM  code completion",
-        "qwen2.5-coder:14b   (~9.0 GB)  8+ GB VRAM  code completion",
-        "qwen3:8b            (~5.2 GB)  6+ GB VRAM  ★ tool-use / agents",
-        "qwen3:14b           (~9.3 GB)  10+ GB VRAM ★ tool-use / agents",
-        "devstral:24b        (~15 GB)   16+ GB VRAM ★ best agentic coding",
-        "qwen3:30b-a3b       (~17 GB)   16+ GB RAM  MoE, top quality",
-        "deepseek-r1:14b     (~9.0 GB)  8+ GB VRAM  reasoning"
+        "qwen2.5-coder:0.5b    (~400 MB)  CPU-safe, testing only",
+        "qwen2.5-coder:1.5b    (~1.0 GB)  CPU-safe, fast",
+        "qwen2.5-coder:3b      (~2.0 GB)  CPU / 4+ GB VRAM",
+        "qwen2.5-coder:7b      (~4.7 GB)  6+ GB VRAM  code completion",
+        "qwen2.5-coder:14b     (~9.0 GB)  8+ GB VRAM  code completion",
+        "ministral-3:8b        (~5.2 GB)  6+ GB VRAM  ★ Mistral agentic (Dec 2025)",
+        "qwen3:8b              (~5.2 GB)  6+ GB VRAM  ★ tool-use / agents",
+        "qwen3:14b             (~9.3 GB)  10+ GB VRAM ★ tool-use / agents",
+        "devstral-small-2:24b  (~15 GB)   16+ GB VRAM ★ best agentic coding (Dec 2025)",
+        "qwen3:30b-a3b         (~17 GB)   16+ GB RAM  MoE, top quality",
+        "deepseek-r1:14b       (~9.0 GB)  8+ GB VRAM  reasoning"
     )
     $modelIds = @(
         "qwen2.5-coder:0.5b",
@@ -589,9 +592,10 @@ function Start-Wizard {
         "qwen2.5-coder:3b",
         "qwen2.5-coder:7b",
         "qwen2.5-coder:14b",
+        "ministral-3:8b",
         "qwen3:8b",
         "qwen3:14b",
-        "devstral:24b",
+        "devstral-small-2:24b",
         "qwen3:30b-a3b",
         "deepseek-r1:14b"
     )
