@@ -139,13 +139,38 @@ function Get-HardwareQuick {
 
 # Pick recommended model index based on VRAM
 function Get-RecommendedModelIndex([double]$vramGb) {
-    if     ($vramGb -ge 16) { return 9 }  # devstral-small-2:24b — best agentic coding
-    elseif ($vramGb -ge 12) { return 8 }  # qwen3:14b   — best tool-use, fits in 12 GB
-    elseif ($vramGb -ge 6)  { return 7 }  # devstral-small-2:8b — Mistral agentic coding, 6+ GB
-    elseif ($vramGb -ge 4)  { return 3 }  # qwen2.5-coder:7b
-    elseif ($vramGb -ge 3)  { return 2 }  # qwen2.5-coder:3b
-    elseif ($vramGb -ge 1)  { return 1 }  # qwen2.5-coder:1.5b
-    else                    { return 0 }  # 0.5b (CPU / unknown)
+    if     ($vramGb -ge 18) { return 10 } # qwen3.6:27b  — best coding 2026, 18+ GB
+    elseif ($vramGb -ge 16) { return 9  } # devstral-small-2:24b — best agentic coding
+    elseif ($vramGb -ge 12) { return 8  } # qwen3:14b   — best tool-use, 12+ GB
+    elseif ($vramGb -ge 8)  { return 7  } # gemma4:12b  — best general 2026, 8+ GB
+    elseif ($vramGb -ge 6)  { return 5  } # ministral-3:8b — fast general, 6+ GB
+    elseif ($vramGb -ge 4)  { return 3  } # qwen2.5-coder:7b
+    elseif ($vramGb -ge 3)  { return 2  } # qwen2.5-coder:3b
+    elseif ($vramGb -ge 1)  { return 1  } # qwen2.5-coder:1.5b
+    else                    { return 0  } # 0.5b (CPU / unknown)
+}
+
+# VRAM required for a given model. Falls back to a heuristic for unknown models.
+function Get-ModelVram([string]$model) {
+    $known = @{
+        "devstral-small-2:24b" = 15.0
+        "devstral:24b"         = 15.0
+        "qwen3.6:27b"          = 17.0
+        "qwen3:30b-a3b"        = 17.0
+        "qwen3:14b"            =  9.3
+        "qwen2.5-coder:14b"    =  9.0
+        "deepseek-r1:14b"      =  9.0
+        "gemma4:12b"           =  8.0
+        "ministral-3:8b"       =  5.2
+        "qwen3:8b"             =  5.2
+        "qwen2.5-coder:7b"     =  4.7
+        "qwen2.5-coder:3b"     =  2.0
+        "qwen2.5-coder:1.5b"   =  1.0
+        "qwen2.5-coder:0.5b"   =  0.4
+    }
+    if ($known.ContainsKey($model)) { return $known[$model] }
+    if ($model -match ':(\d+\.?\d*)b') { return [math]::Round([double]$Matches[1] * 0.65, 1) }
+    return 5.0  # conservative default for unknown models
 }
 
 # All model IDs this machine can serve given its VRAM.
@@ -159,10 +184,11 @@ function Get-ModelCandidates([double]$vramGb) {
         @{ id="qwen2.5-coder:14b";     vram=9.0  },
         @{ id="ministral-3:8b";        vram=5.2  },
         @{ id="qwen3:8b";              vram=5.2  },
-        @{ id="devstral-small-2:8b";   vram=5.2  },
+        @{ id="gemma4:12b";            vram=8.0  },
         @{ id="qwen3:14b";             vram=9.3  },
         @{ id="devstral-small-2:24b";  vram=15.0 },
         @{ id="devstral:24b";          vram=15.0 },
+        @{ id="qwen3.6:27b";           vram=17.0 },
         @{ id="qwen3:30b-a3b";         vram=17.0 },
         @{ id="deepseek-r1:14b";       vram=9.0  }
     )
@@ -211,8 +237,9 @@ function Get-OllamaParallel([double]$vramGb, [string]$model) {
     $modelVram = switch -Wildcard ($model) {
         "devstral-small-2:24b" { 15 }
         "devstral:24b"         { 15 }
-        "devstral-small-2:8b"  { 5  }
+        "qwen3.6:27b"          { 17 }
         "qwen3:30b*"           { 17 }
+        "gemma4:12b"           { 8  }
         "qwen3:14b"            { 9  }
         "qwen2.5-coder:14b"    { 9  }
         "deepseek-r1:14b"      { 9  }
@@ -555,17 +582,18 @@ function Invoke-ModelPull([string]$modelName, [int]$port) {
     Write-Ok "Model '$modelName' ready."
 }
 
-function Start-WorkLoop([string]$coordinator, [string]$apiKey, [string]$ip, [int]$port, [string[]]$modelCandidates) {
-    $headers     = @{ "X-API-Key" = $apiKey }
-    $lastHB      = [DateTime]::MinValue
+function Start-WorkLoop([string]$coordinator, [string]$apiKey, [string]$ip, [int]$port, [double]$vramGb) {
+    $headers    = @{ "X-API-Key" = $apiKey }
+    $lastHB     = [DateTime]::MinValue
+    $vramLimit  = if ($vramGb -le 0) { 8.0 } else { $vramGb - 1.0 }  # 1 GB headroom for OS/driver
 
-    # Pre-populate from ollama list so models already on disk skip the peek/download step
+    # Pre-populate from ollama list so models already on disk skip the download step
     $pulledModels = @{}
     try {
         $env:OLLAMA_HOST = "127.0.0.1:$port"
-        $listOut = & $script:ollamaExe list 2>&1 | Select-Object -Skip 1  # skip header row
+        $listOut = & $script:ollamaExe list 2>&1 | Select-Object -Skip 1
         foreach ($line in $listOut) {
-            $name = ($line -split '\s+')[0]  # "model:tag  ID  size  ..."
+            $name = ($line -split '\s+')[0]
             if ($name) { $pulledModels[$name] = $true }
         }
         if ($pulledModels.Count -gt 0) {
@@ -573,7 +601,7 @@ function Start-WorkLoop([string]$coordinator, [string]$apiKey, [string]$ip, [int
         }
     } catch { }
 
-    Write-Status "RUNNING" "accepting jobs for $($modelCandidates.Count) models — Ctrl+C to quit"
+    Write-Status "RUNNING" "accepting any model that fits in $vramGb GB VRAM — Ctrl+C to quit"
     while ($true) {
         # heartbeat every 15s — re-register automatically if coordinator restarted
         if (([DateTime]::UtcNow - $lastHB).TotalSeconds -ge 15) {
@@ -592,21 +620,21 @@ function Start-WorkLoop([string]$coordinator, [string]$apiKey, [string]$ip, [int
             $lastHB = [DateTime]::UtcNow
         }
 
-        # For each candidate: peek first so we can download before consuming the job.
-        # This prevents holding the coordinator's job slot open during a long download.
+        # Ask coordinator which models have jobs waiting right now, then filter to what fits our VRAM.
+        # This replaces a static catalog — any model the coordinator knows about is fair game.
+        $candidates = @()
+        try {
+            $qResp = Invoke-RestMethod -Uri "$coordinator/agent/jobs/queued-models" `
+                -Method Get -Headers $headers -ErrorAction Stop
+            $candidates = @($qResp.models | Where-Object { (Get-ModelVram $_) -le $vramLimit })
+        } catch { }
+
         $servedJob = $false
-        foreach ($model in $modelCandidates) {
+        foreach ($model in $candidates) {
             $modelEnc = [Uri]::EscapeDataString($model)
 
-            # Step 1: if model isn't local yet, peek to see if demand exists before downloading
+            # Download model if not local yet
             if (-not $pulledModels.ContainsKey($model)) {
-                try {
-                    $peekResp = Invoke-WebRequest -Uri "$coordinator/agent/jobs/peek?model=$modelEnc" `
-                        -Method Get -Headers $headers -UseBasicParsing -ErrorAction Stop
-                    if ($peekResp.StatusCode -ne 200) { continue }  # no demand — skip
-                } catch { continue }
-
-                # Demand exists — download before consuming any job
                 Write-Status "DOWNLOADING" "demand detected — pulling $model"
                 try {
                     Invoke-ModelPull $model $port
@@ -614,12 +642,26 @@ function Start-WorkLoop([string]$coordinator, [string]$apiKey, [string]$ip, [int
                     $script:Model = $model
                     try { Register-WithCoordinator $coordinator $apiKey $port $model $script:hw } catch { }
                 } catch {
-                    Write-Err "Pull failed for $model`: $_"
+                    $errMsg = "Pull failed for ${model}: $_"
+                    Write-Err $errMsg
+                    # Surface download failures in coordinator agent-status so they're visible remotely
+                    try {
+                        $statusBody = @{
+                            phase    = "RUNNING"
+                            detail   = $errMsg
+                            agent_id = $script:AgentId
+                            hostname = $env:COMPUTERNAME
+                            model    = $model
+                        } | ConvertTo-Json
+                        Invoke-RestMethod -Uri "$coordinator/agent-status" -Method Post `
+                            -Body $statusBody -ContentType "application/json" `
+                            -Headers $headers -ErrorAction SilentlyContinue | Out-Null
+                    } catch { }
                     continue
                 }
             }
 
-            # Step 2: model is local — consume and serve the job
+            # Consume and serve the job
             try {
                 $agentIdEnc = [System.Uri]::EscapeDataString($script:AgentId)
                 $resp = Invoke-WebRequest -Uri "$coordinator/agent/jobs/next?model=$modelEnc&agent_id=$agentIdEnc" `
@@ -628,7 +670,7 @@ function Start-WorkLoop([string]$coordinator, [string]$apiKey, [string]$ip, [int
 
                 $job         = $resp.Content | ConvertFrom-Json
                 $jobId       = $job.id
-                $jobBodyJson = $job.body_json   # pre-serialized by coordinator — no ConvertTo-Json needed
+                $jobBodyJson = $job.body_json
                 Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Job $jobId  model=$model" -ForegroundColor DarkCyan
 
                 $t0 = [DateTime]::UtcNow
@@ -693,9 +735,10 @@ function Start-Wizard {
         "qwen2.5-coder:14b",
         "ministral-3:8b",
         "qwen3:8b",
-        "devstral-small-2:8b",
+        "gemma4:12b",
         "qwen3:14b",
         "devstral-small-2:24b",
+        "qwen3.6:27b",
         "qwen3:30b-a3b",
         "deepseek-r1:14b"
     )
@@ -824,7 +867,5 @@ $script:hw = $hw   # make available to work loop for re-registration
 Write-Status "REGISTERING" ""
 $myIp = Register-WithCoordinator $Coordinator $ApiKey $OllamaPort $Model $hw
 
-# 8. Work loop — polls all models this machine can serve; pulls on demand
-$candidates = Get-ModelCandidates $hw.vram_gb
-Write-Step "Will accept jobs for: $($candidates -join ', ')"
-Start-WorkLoop $Coordinator $ApiKey $myIp $OllamaPort $candidates
+# 8. Work loop — dynamically discovers queued models from coordinator and pulls on demand
+Start-WorkLoop $Coordinator $ApiKey $myIp $OllamaPort $hw.vram_gb
