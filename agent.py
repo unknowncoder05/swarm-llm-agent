@@ -488,6 +488,12 @@ import argparse, os, sys, time, warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 def _load(model_id, pipeline_cls, dtype, token=None, **kw):
+    import torch
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            f"CUDA unavailable (torch {torch.__version__} — CPU-only build). "
+            "Re-run the agent to reinstall torch with CUDA support."
+        )
     return pipeline_cls.from_pretrained(
         model_id, dtype=dtype, token=token or None, **kw
     ).to("cuda")
@@ -581,23 +587,26 @@ if __name__ == "__main__":
 '''
 
 def _detect_cuda_index():
-    """Return a pytorch --index-url matching the installed CUDA, or None to use PyPI."""
+    """Return (stable_url, nightly_url) for detected CUDA driver, or (None, None)."""
     try:
         out = subprocess.check_output(
             ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
             stderr=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace"
         ).strip().split("\n")[0]
-        # Infer CUDA version from driver: >=525 → 12.x, >=450 → 11.x
         driver = float(out.split(".")[0])
         if driver >= 550:
-            return "https://download.pytorch.org/whl/cu124"
+            base = "cu124"
         elif driver >= 525:
-            return "https://download.pytorch.org/whl/cu121"
+            base = "cu121"
         elif driver >= 450:
-            return "https://download.pytorch.org/whl/cu118"
+            base = "cu118"
+        else:
+            return None, None
+        return (f"https://download.pytorch.org/whl/{base}",
+                f"https://download.pytorch.org/whl/nightly/{base}")
     except Exception:
         pass
-    return None  # fall back to PyPI (CPU or auto)
+    return None, None
 
 def _pip_install(pkgs, extra_args=None):
     cmd = [sys.executable, "-m", "pip", "install", "--quiet"] + pkgs
@@ -608,28 +617,39 @@ def _pip_install(pkgs, extra_args=None):
 def install_media_deps():
     step("Checking media generation dependencies (diffusers + torch)...")
 
-    # --- torch: try whl index for CUDA, fall back to PyPI (supports newer Python) ---
-    step("pip install torch ...")
-    cuda_index = _detect_cuda_index()
+    cuda_index, nightly_index = _detect_cuda_index()
     torch_installed = False
-    if cuda_index:
-        step(f"  trying {cuda_index} ...")
+
+    # Python 3.14+ has no stable whl wheels — go straight to nightly
+    skip_stable = sys.version_info >= (3, 14)
+
+    if cuda_index and not skip_stable:
+        step(f"  trying stable whl: {cuda_index} ...")
         try:
-            _pip_install(["torch"], ["--index-url", cuda_index])
+            _pip_install(["torch", "torchvision"], ["--index-url", cuda_index])
             torch_installed = True
         except subprocess.CalledProcessError:
-            step("  whl index failed, falling back to PyPI...")
+            step("  stable whl failed, trying nightly...")
+
+    if not torch_installed and nightly_index:
+        step(f"  trying nightly whl: {nightly_index} ...")
+        try:
+            _pip_install(["torch", "torchvision"], ["--index-url", nightly_index, "--pre"])
+            torch_installed = True
+        except subprocess.CalledProcessError:
+            step("  nightly whl also failed, falling back to PyPI...")
+
     if not torch_installed:
+        step("  falling back to PyPI (may be CPU-only on Python 3.14+)...")
         try:
-            _pip_install(["torch"])
+            _pip_install(["torch", "torchvision"])
             torch_installed = True
         except subprocess.CalledProcessError:
-            err("torch install failed - media inference will not work without a GPU runtime")
+            err("torch install failed  -  media inference disabled")
 
     # --- rest of deps ---
     other = [
         ["diffusers", "transformers", "accelerate", "safetensors", "huggingface_hub"],
-        ["torchvision"],
         ["imageio[ffmpeg]", "sentencepiece", "protobuf"],
     ]
     for group in other:
@@ -680,11 +700,17 @@ def _media_loop(coordinator, api_key, agent_id, vram_gb, infer_py_path, hf_token
                 print(_c(YELLOW, "  [media] first job - installing diffusers + torch..."))
                 install_media_deps()
                 try:
-                    import importlib
+                    import importlib, torch as _torch
                     importlib.import_module("diffusers")
                     importlib.import_module("transformers")
+                    if not _torch.cuda.is_available():
+                        raise RuntimeError(
+                            f"torch {_torch.__version__} installed but CUDA unavailable "
+                            "(CPU-only build) — will retry install on next job"
+                        )
                     deps_installed = True
-                    print(_c(GREEN, "  [media] deps ready, starting inference..."))
+                    print(_c(GREEN, f"  [media] deps ready  torch={_torch.__version__}  "
+                             f"cuda={_torch.version.cuda}"))
                 except ImportError as ie:
                     raise RuntimeError(f"Deps installed but import failed: {ie}") from ie
 
