@@ -613,26 +613,42 @@ def _media_loop(coordinator, api_key, agent_id, vram_gb, infer_py_path):
     headers        = {"X-API-Key": api_key}
     deps_installed = False
     aid_enc        = urlquote(agent_id)
+    last_status_log = 0
+    STATUS_INTERVAL = 60  # print "idle" line at most once per minute
+
+    print(_c(CYAN, f"  [media] thread started  -  {vram_gb} GB VRAM  -  polling {coordinator}"))
+
     while True:
         try:
             r = requests.get(
                 f"{coordinator}/agent/media/jobs/next?vram_gb={vram_gb}&agent_id={aid_enc}",
                 headers=headers, timeout=8
             )
-            if r.status_code != 200:
+            if r.status_code == 204:
+                if time.time() - last_status_log >= STATUS_INTERVAL:
+                    ts = time.strftime("%H:%M:%S")
+                    print(f"  [media] [{ts}] idle  -  no jobs queued for {vram_gb} GB VRAM")
+                    last_status_log = time.time()
                 time.sleep(3)
                 continue
+            if r.status_code != 200:
+                print(_c(YELLOW, f"  [media] unexpected status {r.status_code}, retrying..."))
+                time.sleep(5)
+                continue
 
+            last_status_log = time.time()  # reset idle timer on job received
             job      = r.json()
             job_id   = job["id"]
             job_type = job["type"]
             model    = job["model"]
             body     = json.loads(job["body_json"])
-            print(f"  [media] {job_type} {job_id[:8]}  -  {model}")
+            print(_c(CYAN, f"  [media] {job_type} job {job_id[:8]}  -  model={model}"))
 
             if not deps_installed:
+                print(_c(YELLOW, "  [media] first job - installing diffusers + torch..."))
                 install_media_deps()
                 deps_installed = True
+                print(_c(GREEN, "  [media] deps ready, starting inference..."))
 
             tmp_dir = Path(tempfile.gettempdir()) / "swarm-media"
             tmp_dir.mkdir(exist_ok=True)
@@ -696,7 +712,7 @@ def _media_loop(coordinator, api_key, agent_id, vram_gb, infer_py_path):
                     print(f"  [media] video done {ms/1000:.1f}s  {len(data)/1024**2:.1f} MB")
             except Exception as e:
                 err_msg = str(e)
-                print(f"  [media] job {job_id} failed: {err_msg}")
+                print(_c(RED, f"  [media] job {job_id[:8]} failed: {err_msg}"))
                 try:
                     requests.post(
                         f"{coordinator}/agent/media/jobs/{job_id}/error?job_type={job_type}",
@@ -704,8 +720,10 @@ def _media_loop(coordinator, api_key, agent_id, vram_gb, infer_py_path):
                     )
                 except Exception:
                     pass
-        except Exception:
-            time.sleep(3)
+        except Exception as e:
+            ts = time.strftime("%H:%M:%S")
+            print(_c(YELLOW, f"  [media] [{ts}] coordinator unreachable: {e}  -  retrying in 5s"))
+            time.sleep(5)
 
 def start_media_loop(coordinator, api_key, agent_id, vram_gb):
     tmp_dir    = Path(tempfile.gettempdir()) / "swarm-media"
