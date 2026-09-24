@@ -1,5 +1,6 @@
-# Run this on any machine to produce agent-standalone.cmd —
-# a single file that works on Windows by double-click, no companion files needed.
+# Run this to rebuild agent-standalone.cmd from agent.ps1.
+# The resulting .cmd file is a polyglot: double-clickable on Windows AND
+# accepts all the same CLI flags as agent.ps1 (e.g. -SkipModelPull, -MediaModels).
 #
 # Usage:
 #   .\build-standalone.ps1
@@ -15,20 +16,25 @@ if (-not (Test-Path $source)) {
 
 $psCode = Get-Content $source -Raw
 
-# The polyglot header runs as batch on double-click:
-#   1. Sets %~f0 (this file's path) into env var Z
-#   2. Launches PowerShell with ExecutionPolicy Bypass, reads and executes itself
-#   3. Exits the batch process
+# Batch header — two-step approach so %* (CLI args) reach param() properly:
+#   Step 1: extract PS content (everything from "#Requires" onward) into a temp .ps1
+#   Step 2: run the temp file with PowerShell -File, which binds param() correctly
+#   Step 3: delete the temp file
 #
-# PowerShell ignores the header because it is wrapped in a <# ... #> block comment.
+# This file's batch section is wrapped in a <# ... #> block comment so PowerShell
+# ignores it when the file is dot-sourced or run directly as .ps1.
 
-$header = @"
-@(set "Z=%~f0")& powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "iex([io.file]::ReadAllText(`$env:Z))" & exit /b
-<# --- batch header above is a PowerShell block comment --- begin PS1 ---
-"@
+$header = '@echo off
+set "_SF=%~f0" & set "_TP=%TEMP%\swarm_agent_%RANDOM%.ps1"
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "$c=[io.file]::ReadAllText($env:_SF); $i=$c.IndexOf(''#Requires -Version''); [io.file]::WriteAllText($env:_TP,$c.Substring($i))"
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%_TP%" %*
+del "%_TP%" 2>nul
+exit /b
+<# --- batch section above is a PowerShell block comment ---'
 
 $footer = "`n#>"
 
 Set-Content -Path $out -Value ($header + "`n" + $psCode + $footer) -Encoding UTF8
 Write-Host "Built: $out"
 Write-Host "Distribute this single file — users double-click it, no other files needed."
+Write-Host "CLI flags like -SkipModelPull and -MediaModels are forwarded correctly."
