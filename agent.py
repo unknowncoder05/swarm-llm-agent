@@ -105,7 +105,7 @@ def detect_hardware():
         out = subprocess.check_output(
             ["nvidia-smi", "--query-gpu=name,memory.total",
              "--format=csv,noheader,nounits"],
-            stderr=subprocess.DEVNULL, text=True
+            stderr=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace"
         ).strip()
         parts = out.split(",")
         hw["gpu_name"] = parts[0].strip()
@@ -143,8 +143,11 @@ def get_system_info(hw):
     info["hostname"]       = socket.gethostname()
     info["ollama_version"] = "?"
     try:
-        ver = subprocess.check_output(["ollama", "--version"],
-                                      stderr=subprocess.DEVNULL, text=True).strip()
+        ver = subprocess.check_output(
+            ["ollama", "--version"],
+            stderr=subprocess.DEVNULL, text=True,
+            encoding="utf-8", errors="replace"
+        ).strip()
         info["ollama_version"] = re.sub(r"ollama version (is )?", "", ver).strip()
     except Exception:
         pass
@@ -324,7 +327,7 @@ def pull_model(ollama_exe, model, port):
     proc = subprocess.Popen(
         [ollama_exe, "pull", model],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, env=env
+        text=True, encoding="utf-8", errors="replace", env=env
     )
     last_report = 0
     for line in proc.stdout:
@@ -644,7 +647,8 @@ def _media_loop(coordinator, api_key, agent_id, model_list, infer_py_path):
                            "--out-dir", str(out_dir)]
                     if body.get("negative_prompt"):
                         cmd += ["--neg", body["negative_prompt"]]
-                    proc = subprocess.run(cmd, capture_output=True, text=True)
+                    proc = subprocess.run(cmd, capture_output=True, text=True,
+                                         encoding="utf-8", errors="replace")
                     if proc.returncode != 0:
                         raise RuntimeError(f"inference error: {proc.stderr}")
                     out_paths = [l.strip() for l in proc.stdout.splitlines()
@@ -673,7 +677,8 @@ def _media_loop(coordinator, api_key, agent_id, model_list, infer_py_path):
                            "--out-file", out_file]
                     if body.get("negative_prompt"):
                         cmd += ["--neg", body["negative_prompt"]]
-                    proc = subprocess.run(cmd, capture_output=True, text=True)
+                    proc = subprocess.run(cmd, capture_output=True, text=True,
+                                         encoding="utf-8", errors="replace")
                     if proc.returncode != 0:
                         raise RuntimeError(f"inference error: {proc.stderr}")
                     ms   = int((time.time() - t0) * 1000)
@@ -727,7 +732,8 @@ def work_loop(ollama_exe, coordinator, api_key, port, vram_gb):
     try:
         env = dict(os.environ, OLLAMA_HOST=f"127.0.0.1:{port}")
         out = subprocess.check_output(
-            [ollama_exe, "list"], stderr=subprocess.DEVNULL, text=True, env=env
+            [ollama_exe, "list"], stderr=subprocess.DEVNULL, text=True,
+            encoding="utf-8", errors="replace", env=env
         )
         for line in out.splitlines()[1:]:
             name = line.split()[0] if line.split() else ""
@@ -944,7 +950,8 @@ def main():
         try:
             out = subprocess.check_output(
                 ["lsof", "-ti", f"tcp:{args.port}"],
-                stderr=subprocess.DEVNULL, text=True
+                stderr=subprocess.DEVNULL, text=True,
+                encoding="utf-8", errors="replace"
             ).strip()
             if out:
                 step(f"Stopping existing Ollama on port {args.port} ...")
@@ -955,7 +962,8 @@ def main():
     else:
         try:
             out = subprocess.check_output(
-                ["netstat", "-ano"], text=True, stderr=subprocess.DEVNULL
+                ["netstat", "-ano"], text=True, stderr=subprocess.DEVNULL,
+                encoding="utf-8", errors="replace"
             )
             for line in out.splitlines():
                 if f":{args.port}" in line and "LISTENING" in line:
