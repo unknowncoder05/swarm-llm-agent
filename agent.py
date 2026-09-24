@@ -586,27 +586,49 @@ if __name__ == "__main__":
         run_video(a.model, a.prompt, a.neg, a.out_file, a.duration, a.width, a.height, tok)
 '''
 
-def _detect_cuda_index():
-    """Return (stable_url, nightly_url) for detected CUDA driver, or (None, None)."""
+def _cuda_install_candidates():
+    """Return ordered list of (description, pip_extra_args) to try for a CUDA torch build."""
+    candidates = []
     try:
         out = subprocess.check_output(
             ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
             stderr=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace"
         ).strip().split("\n")[0]
         driver = float(out.split(".")[0])
-        if driver >= 550:
-            base = "cu124"
+        # driver → CUDA toolkit version mapping (newest compat first)
+        if driver >= 570:
+            tags = ["cu128", "cu126", "cu124"]
+        elif driver >= 560:
+            tags = ["cu126", "cu124"]
+        elif driver >= 550:
+            tags = ["cu124", "cu126"]
         elif driver >= 525:
-            base = "cu121"
+            tags = ["cu121", "cu124"]
         elif driver >= 450:
-            base = "cu118"
+            tags = ["cu118"]
         else:
-            return None, None
-        return (f"https://download.pytorch.org/whl/{base}",
-                f"https://download.pytorch.org/whl/nightly/{base}")
+            return candidates
+        for tag in tags:
+            stable  = f"https://download.pytorch.org/whl/{tag}"
+            nightly = f"https://download.pytorch.org/whl/nightly/{tag}"
+            candidates.append((f"stable/{tag}",  ["--index-url", stable]))
+            candidates.append((f"nightly/{tag}", ["--index-url", nightly, "--pre"]))
     except Exception:
         pass
-    return None, None
+    return candidates
+
+def _torch_has_cuda():
+    """Spawn a fresh subprocess to check torch.cuda.is_available() (avoids import cache)."""
+    try:
+        r = subprocess.run(
+            [sys.executable, "-c",
+             "import torch; print('1' if torch.cuda.is_available() else '0')"],
+            capture_output=True, text=True, timeout=30,
+            encoding="utf-8", errors="replace"
+        )
+        return r.stdout.strip() == "1"
+    except Exception:
+        return False
 
 def _pip_install(pkgs, extra_args=None):
     cmd = [sys.executable, "-m", "pip", "install", "--quiet"] + pkgs
@@ -617,42 +639,36 @@ def _pip_install(pkgs, extra_args=None):
 def install_media_deps():
     step("Checking media generation dependencies (diffusers + torch)...")
 
-    cuda_index, nightly_index = _detect_cuda_index()
-    torch_installed = False
+    if _torch_has_cuda():
+        step("  torch already has CUDA — skipping reinstall")
+    else:
+        torch_ok = False
+        for desc, extra in _cuda_install_candidates():
+            step(f"  torch: trying {desc} ...")
+            try:
+                # --force-reinstall --no-deps so we replace a CPU build without touching all deps
+                _pip_install(["torch", "torchvision"],
+                             extra + ["--force-reinstall", "--no-deps"])
+                if _torch_has_cuda():
+                    step(f"  CUDA torch installed via {desc}")
+                    torch_ok = True
+                    break
+                step(f"  {desc}: installed but still CPU-only, trying next index...")
+            except subprocess.CalledProcessError:
+                step(f"  {desc}: pip failed, trying next index...")
 
-    # Python 3.14+ has no stable whl wheels — go straight to nightly
-    skip_stable = sys.version_info >= (3, 14)
-
-    if cuda_index and not skip_stable:
-        step(f"  trying stable whl: {cuda_index} ...")
-        try:
-            _pip_install(["torch", "torchvision"], ["--index-url", cuda_index])
-            torch_installed = True
-        except subprocess.CalledProcessError:
-            step("  stable whl failed, trying nightly...")
-
-    if not torch_installed and nightly_index:
-        step(f"  trying nightly whl: {nightly_index} ...")
-        try:
-            _pip_install(["torch", "torchvision"], ["--index-url", nightly_index, "--pre"])
-            torch_installed = True
-        except subprocess.CalledProcessError:
-            step("  nightly whl also failed, falling back to PyPI...")
-
-    if not torch_installed:
-        step("  falling back to PyPI (may be CPU-only on Python 3.14+)...")
-        try:
-            _pip_install(["torch", "torchvision"])
-            torch_installed = True
-        except subprocess.CalledProcessError:
-            err("torch install failed  -  media inference disabled")
+        if not torch_ok:
+            step("  torch: all CUDA indexes failed, falling back to PyPI...")
+            try:
+                _pip_install(["torch", "torchvision"], ["--force-reinstall", "--no-deps"])
+            except subprocess.CalledProcessError:
+                err("torch install failed  -  media inference disabled")
 
     # --- rest of deps ---
-    other = [
+    for group in [
         ["diffusers", "transformers", "accelerate", "safetensors", "huggingface_hub"],
         ["imageio[ffmpeg]", "sentencepiece", "protobuf"],
-    ]
-    for group in other:
+    ]:
         step(f"pip install {group[0]} ...")
         try:
             _pip_install(group, ["--upgrade"])
@@ -671,48 +687,66 @@ def _media_loop(coordinator, api_key, agent_id, vram_gb, infer_py_path, hf_token
     print(_c(CYAN, f"  [media] thread started  -  {vram_gb} GB VRAM  -  polling {coordinator}"))
 
     while True:
+        # ── poll coordinator ──────────────────────────────────────────────────
         try:
             r = requests.get(
                 f"{coordinator}/agent/media/jobs/next?vram_gb={vram_gb}&agent_id={aid_enc}",
                 headers=headers, timeout=8
             )
-            if r.status_code == 204:
-                if time.time() - last_status_log >= STATUS_INTERVAL:
-                    ts = time.strftime("%H:%M:%S")
-                    print(f"  [media] [{ts}] idle  -  no jobs queued for {vram_gb} GB VRAM")
-                    last_status_log = time.time()
-                time.sleep(3)
-                continue
-            if r.status_code != 200:
-                print(_c(YELLOW, f"  [media] unexpected status {r.status_code}, retrying..."))
-                time.sleep(5)
-                continue
+        except Exception as e:
+            ts = time.strftime("%H:%M:%S")
+            print(_c(YELLOW, f"  [media] [{ts}] coordinator unreachable: {e}  -  retrying in 5s"))
+            time.sleep(5)
+            continue
 
-            last_status_log = time.time()  # reset idle timer on job received
-            job      = r.json()
-            job_id   = job["id"]
-            job_type = job["type"]
-            model    = job["model"]
-            body     = json.loads(job["body_json"])
-            print(_c(CYAN, f"  [media] {job_type} job {job_id[:8]}  -  model={model}"))
+        if r.status_code == 204:
+            if time.time() - last_status_log >= STATUS_INTERVAL:
+                ts = time.strftime("%H:%M:%S")
+                print(f"  [media] [{ts}] idle  -  no jobs queued for {vram_gb} GB VRAM")
+                last_status_log = time.time()
+            time.sleep(3)
+            continue
+        if r.status_code != 200:
+            print(_c(YELLOW, f"  [media] unexpected status {r.status_code}, retrying..."))
+            time.sleep(5)
+            continue
 
-            if not deps_installed:
-                print(_c(YELLOW, "  [media] first job - installing diffusers + torch..."))
+        # ── got a job ─────────────────────────────────────────────────────────
+        last_status_log = time.time()
+        job      = r.json()
+        job_id   = job["id"]
+        job_type = job["type"]
+        model    = job["model"]
+        body     = json.loads(job["body_json"])
+        print(_c(CYAN, f"  [media] {job_type} job {job_id[:8]}  -  model={model}"))
+
+        # ── lazy deps install ─────────────────────────────────────────────────
+        if not deps_installed:
+            print(_c(YELLOW, "  [media] installing deps (first job)..."))
+            try:
                 install_media_deps()
+                import importlib, torch as _torch
+                importlib.import_module("diffusers")
+                importlib.import_module("transformers")
+                if not _torch.cuda.is_available():
+                    raise RuntimeError(
+                        f"torch {_torch.__version__} is CPU-only — "
+                        "will retry CUDA install on next job"
+                    )
+                deps_installed = True
+                print(_c(GREEN, f"  [media] deps ready  "
+                         f"torch={_torch.__version__}  cuda={_torch.version.cuda}"))
+            except Exception as deps_err:
+                print(_c(RED, f"  [media] deps failed: {deps_err}"))
                 try:
-                    import importlib, torch as _torch
-                    importlib.import_module("diffusers")
-                    importlib.import_module("transformers")
-                    if not _torch.cuda.is_available():
-                        raise RuntimeError(
-                            f"torch {_torch.__version__} installed but CUDA unavailable "
-                            "(CPU-only build) — will retry install on next job"
-                        )
-                    deps_installed = True
-                    print(_c(GREEN, f"  [media] deps ready  torch={_torch.__version__}  "
-                             f"cuda={_torch.version.cuda}"))
-                except ImportError as ie:
-                    raise RuntimeError(f"Deps installed but import failed: {ie}") from ie
+                    requests.post(
+                        f"{coordinator}/agent/media/jobs/{job_id}/error?job_type={job_type}",
+                        json={"error": str(deps_err)}, headers=headers, timeout=10
+                    )
+                except Exception:
+                    pass
+                time.sleep(5)
+                continue  # back to polling; next job will retry install
 
             tmp_dir = Path(tempfile.gettempdir()) / "swarm-media"
             tmp_dir.mkdir(exist_ok=True)
