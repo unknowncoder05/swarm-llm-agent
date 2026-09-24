@@ -591,30 +591,64 @@ if __name__ == "__main__":
         run_video(a.model, a.prompt, a.neg, a.out_file, a.duration, a.width, a.height)
 '''
 
+def _detect_cuda_index():
+    """Return a pytorch --index-url matching the installed CUDA, or None to use PyPI."""
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
+            stderr=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace"
+        ).strip().split("\n")[0]
+        # Infer CUDA version from driver: >=525 → 12.x, >=450 → 11.x
+        driver = float(out.split(".")[0])
+        if driver >= 550:
+            return "https://download.pytorch.org/whl/cu124"
+        elif driver >= 525:
+            return "https://download.pytorch.org/whl/cu121"
+        elif driver >= 450:
+            return "https://download.pytorch.org/whl/cu118"
+    except Exception:
+        pass
+    return None  # fall back to PyPI (CPU or auto)
+
+def _pip_install(pkgs, extra_args=None):
+    cmd = [sys.executable, "-m", "pip", "install", "--quiet"] + pkgs
+    if extra_args:
+        cmd += extra_args
+    subprocess.check_call(cmd, stderr=subprocess.STDOUT)
+
 def install_media_deps():
     step("Checking media generation dependencies (diffusers + torch)...")
-    # Install with --upgrade so stale installs don't cause version mismatches.
-    # safetensors and huggingface_hub are required by FLUX / modern diffusers.
-    pkgs = [
-        ["torch", "--index-url", "https://download.pytorch.org/whl/cu121"],
-        ["diffusers", "--upgrade"],
-        ["transformers", "--upgrade"],
-        ["accelerate", "--upgrade"],
-        ["safetensors", "--upgrade"],
-        ["huggingface_hub", "--upgrade"],
-        ["imageio[ffmpeg]"],
-        ["sentencepiece"],
-        ["protobuf"],
-    ]
-    for pkg in pkgs:
-        step(f"pip install {pkg[0]} ...")
+
+    # --- torch: try whl index for CUDA, fall back to PyPI (supports newer Python) ---
+    step("pip install torch ...")
+    cuda_index = _detect_cuda_index()
+    torch_installed = False
+    if cuda_index:
+        step(f"  trying {cuda_index} ...")
         try:
-            subprocess.check_call(
-                [sys.executable, "-m", "pip", "install", "--quiet"] + pkg,
-                stderr=subprocess.STDOUT,
-            )
+            _pip_install(["torch"], ["--index-url", cuda_index])
+            torch_installed = True
+        except subprocess.CalledProcessError:
+            step("  whl index failed, falling back to PyPI...")
+    if not torch_installed:
+        try:
+            _pip_install(["torch"])
+            torch_installed = True
+        except subprocess.CalledProcessError:
+            err("torch install failed - media inference will not work without a GPU runtime")
+
+    # --- rest of deps ---
+    other = [
+        ["diffusers", "transformers", "accelerate", "safetensors", "huggingface_hub"],
+        ["imageio[ffmpeg]", "sentencepiece", "protobuf"],
+    ]
+    for group in other:
+        step(f"pip install {group[0]} ...")
+        try:
+            _pip_install(group, ["--upgrade"])
         except subprocess.CalledProcessError as e:
-            err(f"pip install {pkg[0]} failed: {e}")
+            err(f"pip install {group[0]} failed: {e}")
+
     ok("Media deps ready.")
 
 def _media_loop(coordinator, api_key, agent_id, vram_gb, infer_py_path):
