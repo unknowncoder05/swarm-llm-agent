@@ -592,11 +592,19 @@ if __name__ == "__main__":
 '''
 
 def install_media_deps():
-    step("Checking media generation dependencies (Python + diffusers)...")
+    step("Checking media generation dependencies (diffusers + torch)...")
+    # Install with --upgrade so stale installs don't cause version mismatches.
+    # safetensors and huggingface_hub are required by FLUX / modern diffusers.
     pkgs = [
         ["torch", "--index-url", "https://download.pytorch.org/whl/cu121"],
-        ["diffusers"], ["transformers"], ["accelerate"],
-        ["imageio[ffmpeg]"], ["sentencepiece"], ["protobuf"],
+        ["diffusers", "--upgrade"],
+        ["transformers", "--upgrade"],
+        ["accelerate", "--upgrade"],
+        ["safetensors", "--upgrade"],
+        ["huggingface_hub", "--upgrade"],
+        ["imageio[ffmpeg]"],
+        ["sentencepiece"],
+        ["protobuf"],
     ]
     for pkg in pkgs:
         step(f"pip install {pkg[0]} ...")
@@ -647,8 +655,14 @@ def _media_loop(coordinator, api_key, agent_id, vram_gb, infer_py_path):
             if not deps_installed:
                 print(_c(YELLOW, "  [media] first job - installing diffusers + torch..."))
                 install_media_deps()
-                deps_installed = True
-                print(_c(GREEN, "  [media] deps ready, starting inference..."))
+                try:
+                    import importlib
+                    importlib.import_module("diffusers")
+                    importlib.import_module("transformers")
+                    deps_installed = True
+                    print(_c(GREEN, "  [media] deps ready, starting inference..."))
+                except ImportError as ie:
+                    raise RuntimeError(f"Deps installed but import failed: {ie}") from ie
 
             tmp_dir = Path(tempfile.gettempdir()) / "swarm-media"
             tmp_dir.mkdir(exist_ok=True)

@@ -699,9 +699,11 @@ function Install-MediaDeps {
 
     $pkgs = @(
         "torch --index-url https://download.pytorch.org/whl/cu121",
-        "diffusers",
-        "transformers",
-        "accelerate",
+        "diffusers --upgrade",
+        "transformers --upgrade",
+        "accelerate --upgrade",
+        "safetensors --upgrade",
+        "huggingface_hub --upgrade",
         "imageio[ffmpeg]",
         "sentencepiece",
         "protobuf"
@@ -743,7 +745,9 @@ function Start-MediaWorkLoop([string]$coordinator, [string]$apiKey, [string]$age
                     Write-Host "  [media] installing diffusers + torch (first job)..." -ForegroundColor Cyan
                     $pkgs = @(
                         @("torch", "--index-url", "https://download.pytorch.org/whl/cu121"),
-                        @("diffusers"), @("transformers"), @("accelerate"),
+                        @("diffusers", "--upgrade"), @("transformers", "--upgrade"),
+                        @("accelerate", "--upgrade"), @("safetensors", "--upgrade"),
+                        @("huggingface_hub", "--upgrade"),
                         @("imageio[ffmpeg]"), @("sentencepiece"), @("protobuf")
                     )
                     foreach ($pkg in $pkgs) { python -m pip install --quiet @pkg }
