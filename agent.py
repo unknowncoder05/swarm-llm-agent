@@ -595,13 +595,16 @@ def run_video(model, prompt, neg, out_file, duration, width, height, token=None)
     elif model == "cogvideox-2b":
         from diffusers import CogVideoXPipeline
         pipe = _load("THUDM/CogVideoX-2b", CogVideoXPipeline, torch.bfloat16, token)
+        # CogVideoX is trained at 720x480, 49 frames (6s). Resolution is not adjustable.
         result = pipe(prompt=prompt, num_inference_steps=50,
-                      num_frames=duration * 8, guidance_scale=6)
+                      num_frames=49, guidance_scale=6,
+                      width=720, height=480)
     elif model == "cogvideox-5b":
         from diffusers import CogVideoXPipeline
         pipe = _load("THUDM/CogVideoX-5b", CogVideoXPipeline, torch.bfloat16, token)
         result = pipe(prompt=prompt, num_inference_steps=50,
-                      num_frames=duration * 8, guidance_scale=6)
+                      num_frames=49, guidance_scale=6,
+                      width=720, height=480)
     elif model == "wan-2.1-t2v-1.3b":
         from diffusers import WanPipeline
         pipe = _load("Wan-AI/Wan2.1-T2V-1.3B-Diffusers", WanPipeline, torch.bfloat16, token)
