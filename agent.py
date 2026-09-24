@@ -584,40 +584,56 @@ def run_image(model, prompt, neg, out_dir, n, size, quality, token=None):
         img.save(fp)
         print(fp, flush=True)
 
+def _progress_cb(total_steps):
+    """Return a diffusers callback that prints PROGRESS lines to stdout."""
+    def cb(pipe, step, timestep, kwargs):
+        print(f"PROGRESS {step+1}/{total_steps}", flush=True)
+        return kwargs
+    return cb
+
 def run_video(model, prompt, neg, out_file, duration, width, height, token=None):
     import torch
+    steps = 50
+    cb = _progress_cb(steps)
     if model == "ltx-video":
         from diffusers import LTXPipeline
         pipe = _load("Lightricks/LTX-Video", LTXPipeline, torch.bfloat16, token)
         result = pipe(prompt=prompt, negative_prompt=neg or None,
                       width=width, height=height,
-                      num_frames=duration * 8 + 1, num_inference_steps=50)
+                      num_frames=duration * 8 + 1, num_inference_steps=steps,
+                      callback_on_step_end=cb)
     elif model == "cogvideox-2b":
         from diffusers import CogVideoXPipeline
         pipe = _load("THUDM/CogVideoX-2b", CogVideoXPipeline, torch.bfloat16, token)
         # CogVideoX is trained at 720x480, 49 frames (6s). Resolution is not adjustable.
-        result = pipe(prompt=prompt, num_inference_steps=50,
+        result = pipe(prompt=prompt, num_inference_steps=steps,
                       num_frames=49, guidance_scale=6,
-                      width=720, height=480)
+                      width=720, height=480,
+                      callback_on_step_end=cb)
     elif model == "cogvideox-5b":
         from diffusers import CogVideoXPipeline
         pipe = _load("THUDM/CogVideoX-5b", CogVideoXPipeline, torch.bfloat16, token)
-        result = pipe(prompt=prompt, num_inference_steps=50,
+        result = pipe(prompt=prompt, num_inference_steps=steps,
                       num_frames=49, guidance_scale=6,
-                      width=720, height=480)
+                      width=720, height=480,
+                      callback_on_step_end=cb)
     elif model == "wan-2.1-t2v-1.3b":
         from diffusers import WanPipeline
         pipe = _load("Wan-AI/Wan2.1-T2V-1.3B-Diffusers", WanPipeline, torch.bfloat16, token)
+        # Wan requires num_frames = 4k+1; native fps is 16
         result = pipe(prompt=prompt, negative_prompt=neg or None,
                       height=height, width=width,
-                      num_frames=duration * 16, guidance_scale=5.0)
+                      num_frames=duration * 16 + 1, guidance_scale=5.0,
+                      callback_on_step_end=cb)
     else:
         sys.exit(f"Unknown video model: {model}")
     frames = result.frames[0]
     import numpy as np, imageio
     frames_np = [np.array(f) for f in frames]
     os.makedirs(os.path.dirname(os.path.abspath(out_file)), exist_ok=True)
-    imageio.mimwrite(out_file, frames_np, fps=8, quality=8)
+    _MODEL_FPS = {"wan-2.1-t2v-1.3b": 16}
+    fps = _MODEL_FPS.get(model, 8)
+    imageio.mimwrite(out_file, frames_np, fps=fps, quality=8)
     print(out_file, flush=True)
 
 if __name__ == "__main__":
@@ -888,10 +904,28 @@ def _media_loop(coordinator, api_key, agent_id, vram_gb, infer_py_path, hf_token
                     cmd += ["--neg", body["negative_prompt"]]
                 if hf_token:
                     cmd += ["--hf-token", hf_token]
-                proc = subprocess.run(cmd, capture_output=True, text=True,
-                                      encoding="utf-8", errors="replace")
+                # Stream stdout to capture PROGRESS lines in real time
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                        text=True, encoding="utf-8", errors="replace")
+                stderr_buf = []
+                for line in proc.stdout:
+                    line = line.strip()
+                    if line.startswith("PROGRESS "):
+                        try:
+                            step, total = map(int, line.split()[1].split("/"))
+                            pct = int(step / total * 100)
+                            requests.post(
+                                f"{coordinator}/agent/media/jobs/{job_id}/progress?job_type=video",
+                                json={"step": step, "total": total, "pct": pct},
+                                headers=headers, timeout=5
+                            )
+                            print(f"  [media] video {job_id[:8]} step {step}/{total} ({pct}%)")
+                        except Exception:
+                            pass
+                stderr_out = proc.stderr.read()
+                proc.wait()
                 if proc.returncode != 0:
-                    raise RuntimeError(f"inference error: {proc.stderr}")
+                    raise RuntimeError(f"inference error: {stderr_out}")
                 ms   = int((time.time() - t0) * 1000)
                 data = open(out_file, "rb").read()
                 requests.post(
