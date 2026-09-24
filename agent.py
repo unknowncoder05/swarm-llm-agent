@@ -488,6 +488,7 @@ import argparse, os, sys, time, warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 def _load(model_id, pipeline_cls, dtype, token=None, **kw):
+    """Load pipeline fully onto GPU. Use when model fits in VRAM."""
     import torch
     if not torch.cuda.is_available():
         raise RuntimeError(
@@ -495,39 +496,92 @@ def _load(model_id, pipeline_cls, dtype, token=None, **kw):
             "Re-run the agent to reinstall torch with CUDA support."
         )
     return pipeline_cls.from_pretrained(
-        model_id, dtype=dtype, token=token or None, **kw
+        model_id, torch_dtype=dtype, token=token or None, **kw
     ).to("cuda")
+
+def _load_offload(model_id, pipeline_cls, dtype, token=None, **kw):
+    """Load pipeline with CPU offload. Mutually exclusive with .to('cuda')."""
+    import torch
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            f"CUDA unavailable (torch {torch.__version__} — CPU-only build). "
+            "Re-run the agent to reinstall torch with CUDA support."
+        )
+    pipe = pipeline_cls.from_pretrained(
+        model_id, torch_dtype=dtype, token=token or None, **kw
+    )
+    pipe.enable_model_cpu_offload()
+    return pipe
 
 def run_image(model, prompt, neg, out_dir, n, size, quality, token=None):
     import torch
     w, h = map(int, size.split("x"))
-    steps, guidance = 30, 7.5
+    os.makedirs(out_dir, exist_ok=True)
+
     if model == "flux-schnell":
         from diffusers import FluxPipeline
         pipe = _load("black-forest-labs/FLUX.1-schnell", FluxPipeline, torch.bfloat16, token)
-        steps, guidance = 4, 0.0
+        images = pipe(prompt=prompt, num_inference_steps=4, guidance_scale=0.0,
+                      width=w, height=h, num_images_per_prompt=n).images
+
     elif model == "flux-dev":
         from diffusers import FluxPipeline
         pipe = _load("black-forest-labs/FLUX.1-dev", FluxPipeline, torch.bfloat16, token)
-        steps, guidance = 20, 3.5
+        images = pipe(prompt=prompt, num_inference_steps=20, guidance_scale=3.5,
+                      width=w, height=h, num_images_per_prompt=n).images
+
     elif model == "sd3.5-medium":
         from diffusers import StableDiffusion3Pipeline
-        pipe = _load("stabilityai/stable-diffusion-3.5-medium", StableDiffusion3Pipeline, torch.bfloat16, token)
-        steps, guidance = 28, 7.0
+        pipe = _load("stabilityai/stable-diffusion-3.5-medium",
+                     StableDiffusion3Pipeline, torch.bfloat16, token)
+        images = pipe(prompt=prompt, negative_prompt=neg or None,
+                      num_inference_steps=28, guidance_scale=7.0,
+                      width=w, height=h, num_images_per_prompt=n).images
+
     elif model == "sdxl":
-        from diffusers import StableDiffusionXLPipeline
-        pipe = _load("stabilityai/stable-diffusion-xl-base-1.0", StableDiffusionXLPipeline,
-                     torch.float16, token, use_safetensors=True, variant="fp16")
+        from diffusers import StableDiffusionXLPipeline, StableDiffusionXLImg2ImgPipeline
+        # SDXL requires base + refiner; base alone produces low-quality images.
+        # enable_model_cpu_offload handles VRAM — do NOT call .to("cuda") with it.
+        base = _load_offload(
+            "stabilityai/stable-diffusion-xl-base-1.0",
+            StableDiffusionXLPipeline, torch.float16, token,
+            use_safetensors=True, variant="fp16",
+        )
+        refiner = _load_offload(
+            "stabilityai/stable-diffusion-xl-refiner-1.0",
+            StableDiffusionXLImg2ImgPipeline, torch.float16, token,
+            use_safetensors=True, variant="fp16",
+        )
+        default_neg = ("worst quality, low quality, blurry, watermark, "
+                       "ugly, distorted, deformed, noise")
+        neg_prompt = neg if neg else default_neg
+        steps, guidance, denoise_frac = 40, 7.5, 0.8
+
+        images = []
+        for _ in range(n):
+            # Base generates low-frequency structure as a latent
+            latent = base(
+                prompt=prompt, negative_prompt=neg_prompt,
+                num_inference_steps=steps, guidance_scale=guidance,
+                denoising_end=denoise_frac,
+                output_type="latent",
+                width=w, height=h,
+            ).images
+            # Refiner adds fine detail
+            img = refiner(
+                prompt=prompt, negative_prompt=neg_prompt,
+                num_inference_steps=steps, guidance_scale=guidance,
+                denoising_start=denoise_frac,
+                image=latent,
+            ).images[0]
+            images.append(img)
+
     else:
         sys.exit(f"Unknown image model: {model}")
-    if hasattr(pipe, "enable_model_cpu_offload"):
-        pipe.enable_model_cpu_offload()
-    os.makedirs(out_dir, exist_ok=True)
-    for i in range(n):
-        result = pipe(prompt=prompt, negative_prompt=neg or None,
-                      num_inference_steps=steps, guidance_scale=guidance, width=w, height=h)
+
+    for i, img in enumerate(images):
         fp = os.path.join(out_dir, f"img_{i}_{int(time.time())}.png")
-        result.images[0].save(fp)
+        img.save(fp)
         print(fp, flush=True)
 
 def run_video(model, prompt, neg, out_file, duration, width, height, token=None):
