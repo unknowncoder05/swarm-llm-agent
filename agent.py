@@ -748,84 +748,81 @@ def _media_loop(coordinator, api_key, agent_id, vram_gb, infer_py_path, hf_token
                 time.sleep(5)
                 continue  # back to polling; next job will retry install
 
-            tmp_dir = Path(tempfile.gettempdir()) / "swarm-media"
-            tmp_dir.mkdir(exist_ok=True)
-            t0 = time.time()
+        # ── run inference ─────────────────────────────────────────────────────
+        tmp_dir = Path(tempfile.gettempdir()) / "swarm-media"
+        tmp_dir.mkdir(exist_ok=True)
+        t0 = time.time()
 
-            try:
-                if job_type == "image":
-                    out_dir = tmp_dir / job_id
-                    out_dir.mkdir(exist_ok=True)
-                    cmd = [sys.executable, str(infer_py_path),
-                           "--type", "image", "--model", model,
-                           "--prompt", body["prompt"],
-                           "--n", str(body.get("n", 1)),
-                           "--size", body.get("size", "1024x1024"),
-                           "--quality", body.get("quality", "standard"),
-                           "--out-dir", str(out_dir)]
-                    if body.get("negative_prompt"):
-                        cmd += ["--neg", body["negative_prompt"]]
-                    if hf_token:
-                        cmd += ["--hf-token", hf_token]
-                    proc = subprocess.run(cmd, capture_output=True, text=True,
-                                         encoding="utf-8", errors="replace")
-                    if proc.returncode != 0:
-                        raise RuntimeError(f"inference error: {proc.stderr}")
-                    out_paths = [l.strip() for l in proc.stdout.splitlines()
-                                 if l.strip() and os.path.isfile(l.strip())]
-                    if not out_paths:
-                        raise RuntimeError("no output files produced")
-                    out_file = out_paths[0]
-                    ms  = int((time.time() - t0) * 1000)
-                    ext = Path(out_file).suffix.lstrip(".")
-                    data = open(out_file, "rb").read()
-                    requests.post(
-                        f"{coordinator}/agent/media/jobs/{job_id}/result"
-                        f"?job_type=image&ext={ext}&elapsed_ms={ms}",
-                        data=data, headers={**headers, "Content-Type": "application/octet-stream"},
-                        timeout=120
-                    ).raise_for_status()
-                    print(f"  [media] image done {ms/1000:.1f}s  {len(data)/1024**2:.1f} MB")
-                else:
-                    out_file = str(tmp_dir / f"{job_id}.mp4")
-                    cmd = [sys.executable, str(infer_py_path),
-                           "--type", "video", "--model", model,
-                           "--prompt", body["prompt"],
-                           "--duration", str(body.get("duration", 5)),
-                           "--width",    str(body.get("width",  512)),
-                           "--height",   str(body.get("height", 512)),
-                           "--out-file", out_file]
-                    if body.get("negative_prompt"):
-                        cmd += ["--neg", body["negative_prompt"]]
-                    if hf_token:
-                        cmd += ["--hf-token", hf_token]
-                    proc = subprocess.run(cmd, capture_output=True, text=True,
-                                         encoding="utf-8", errors="replace")
-                    if proc.returncode != 0:
-                        raise RuntimeError(f"inference error: {proc.stderr}")
-                    ms   = int((time.time() - t0) * 1000)
-                    data = open(out_file, "rb").read()
-                    requests.post(
-                        f"{coordinator}/agent/media/jobs/{job_id}/result"
-                        f"?job_type=video&ext=mp4&elapsed_ms={ms}",
-                        data=data, headers={**headers, "Content-Type": "application/octet-stream"},
-                        timeout=600
-                    ).raise_for_status()
-                    print(f"  [media] video done {ms/1000:.1f}s  {len(data)/1024**2:.1f} MB")
-            except Exception as e:
-                err_msg = str(e)
-                print(_c(RED, f"  [media] job {job_id[:8]} failed: {err_msg}"))
-                try:
-                    requests.post(
-                        f"{coordinator}/agent/media/jobs/{job_id}/error?job_type={job_type}",
-                        json={"error": err_msg}, headers=headers, timeout=10
-                    )
-                except Exception:
-                    pass
+        try:
+            if job_type == "image":
+                out_dir = tmp_dir / job_id
+                out_dir.mkdir(exist_ok=True)
+                cmd = [sys.executable, str(infer_py_path),
+                       "--type", "image", "--model", model,
+                       "--prompt", body["prompt"],
+                       "--n", str(body.get("n", 1)),
+                       "--size", body.get("size", "1024x1024"),
+                       "--quality", body.get("quality", "standard"),
+                       "--out-dir", str(out_dir)]
+                if body.get("negative_prompt"):
+                    cmd += ["--neg", body["negative_prompt"]]
+                if hf_token:
+                    cmd += ["--hf-token", hf_token]
+                proc = subprocess.run(cmd, capture_output=True, text=True,
+                                      encoding="utf-8", errors="replace")
+                if proc.returncode != 0:
+                    raise RuntimeError(f"inference error: {proc.stderr}")
+                out_paths = [l.strip() for l in proc.stdout.splitlines()
+                             if l.strip() and os.path.isfile(l.strip())]
+                if not out_paths:
+                    raise RuntimeError("no output files produced")
+                out_file = out_paths[0]
+                ms  = int((time.time() - t0) * 1000)
+                ext = Path(out_file).suffix.lstrip(".")
+                data = open(out_file, "rb").read()
+                requests.post(
+                    f"{coordinator}/agent/media/jobs/{job_id}/result"
+                    f"?job_type=image&ext={ext}&elapsed_ms={ms}",
+                    data=data, headers={**headers, "Content-Type": "application/octet-stream"},
+                    timeout=120
+                ).raise_for_status()
+                print(f"  [media] image done {ms/1000:.1f}s  {len(data)/1024**2:.1f} MB")
+            else:
+                out_file = str(tmp_dir / f"{job_id}.mp4")
+                cmd = [sys.executable, str(infer_py_path),
+                       "--type", "video", "--model", model,
+                       "--prompt", body["prompt"],
+                       "--duration", str(body.get("duration", 5)),
+                       "--width",    str(body.get("width",  512)),
+                       "--height",   str(body.get("height", 512)),
+                       "--out-file", out_file]
+                if body.get("negative_prompt"):
+                    cmd += ["--neg", body["negative_prompt"]]
+                if hf_token:
+                    cmd += ["--hf-token", hf_token]
+                proc = subprocess.run(cmd, capture_output=True, text=True,
+                                      encoding="utf-8", errors="replace")
+                if proc.returncode != 0:
+                    raise RuntimeError(f"inference error: {proc.stderr}")
+                ms   = int((time.time() - t0) * 1000)
+                data = open(out_file, "rb").read()
+                requests.post(
+                    f"{coordinator}/agent/media/jobs/{job_id}/result"
+                    f"?job_type=video&ext=mp4&elapsed_ms={ms}",
+                    data=data, headers={**headers, "Content-Type": "application/octet-stream"},
+                    timeout=600
+                ).raise_for_status()
+                print(f"  [media] video done {ms/1000:.1f}s  {len(data)/1024**2:.1f} MB")
         except Exception as e:
-            ts = time.strftime("%H:%M:%S")
-            print(_c(YELLOW, f"  [media] [{ts}] coordinator unreachable: {e}  -  retrying in 5s"))
-            time.sleep(5)
+            err_msg = str(e)
+            print(_c(RED, f"  [media] job {job_id[:8]} failed: {err_msg}"))
+            try:
+                requests.post(
+                    f"{coordinator}/agent/media/jobs/{job_id}/error?job_type={job_type}",
+                    json={"error": err_msg}, headers=headers, timeout=10
+                )
+            except Exception:
+                pass
 
 def start_media_loop(coordinator, api_key, agent_id, vram_gb, hf_token=""):
     tmp_dir    = Path(tempfile.gettempdir()) / "swarm-media"
