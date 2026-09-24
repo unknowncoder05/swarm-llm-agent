@@ -496,7 +496,7 @@ def _load(model_id, pipeline_cls, dtype, token=None, **kw):
             "Re-run the agent to reinstall torch with CUDA support."
         )
     return pipeline_cls.from_pretrained(
-        model_id, torch_dtype=dtype, token=token or None, **kw
+        model_id, dtype=dtype, token=token or None, **kw
     ).to("cuda")
 
 def _load_offload(model_id, pipeline_cls, dtype, token=None, **kw):
@@ -508,7 +508,7 @@ def _load_offload(model_id, pipeline_cls, dtype, token=None, **kw):
             "Re-run the agent to reinstall torch with CUDA support."
         )
     pipe = pipeline_cls.from_pretrained(
-        model_id, torch_dtype=dtype, token=token or None, **kw
+        model_id, dtype=dtype, token=token or None, **kw
     )
     pipe.enable_model_cpu_offload()
     return pipe
@@ -671,11 +671,12 @@ def _cuda_install_candidates():
         pass
     return candidates
 
-def _torch_has_cuda():
+def _torch_has_cuda(python_exe=None):
     """Spawn a fresh subprocess to check torch.cuda.is_available() (avoids import cache)."""
+    exe = python_exe or sys.executable
     try:
         r = subprocess.run(
-            [sys.executable, "-c",
+            [exe, "-c",
              "import torch; print('1' if torch.cuda.is_available() else '0')"],
             capture_output=True, text=True, timeout=30,
             encoding="utf-8", errors="replace"
@@ -684,59 +685,90 @@ def _torch_has_cuda():
     except Exception:
         return False
 
-def _pip_install(pkgs, extra_args=None):
-    cmd = [sys.executable, "-m", "pip", "install", "--quiet"] + pkgs
+def _find_cuda_python():
+    """Return the Python executable that has CUDA-enabled torch.
+
+    On Python 3.14+ Windows, PyTorch has no CUDA wheels — try the Windows
+    Python Launcher (py -3.12 / py -3.13 / py -3.11) which likely has an
+    older Python where CUDA wheels exist.
+    """
+    if _torch_has_cuda():
+        return sys.executable
+    if platform.system() == "Windows":
+        for ver in ["3.12", "3.13", "3.11", "3.10"]:
+            try:
+                r = subprocess.run(
+                    ["py", f"-{ver}", "-c", "import sys; print(sys.executable)"],
+                    capture_output=True, text=True, timeout=10,
+                    encoding="utf-8", errors="replace"
+                )
+                if r.returncode != 0 or not r.stdout.strip():
+                    continue
+                exe = r.stdout.strip()
+                if _torch_has_cuda(exe):
+                    step(f"  py -{ver} has CUDA torch — using {exe} for inference")
+                    return exe
+            except Exception:
+                pass
+    return sys.executable  # no better option found
+
+def _pip_install(pkgs, extra_args=None, python_exe=None):
+    exe = python_exe or sys.executable
+    cmd = [exe, "-m", "pip", "install", "--quiet"] + pkgs
     if extra_args:
         cmd += extra_args
     subprocess.check_call(cmd, stderr=subprocess.STDOUT)
 
-def install_media_deps():
-    step("Checking media generation dependencies (diffusers + torch)...")
+def install_media_deps(python_exe=None):
+    exe = python_exe or sys.executable
+    step(f"Checking media deps for {exe} ...")
 
-    if _torch_has_cuda():
+    if _torch_has_cuda(exe):
         step("  torch already has CUDA — skipping reinstall")
     else:
         torch_ok = False
         for desc, extra in _cuda_install_candidates():
             step(f"  torch: trying {desc} ...")
             try:
-                # --force-reinstall --no-deps so we replace a CPU build without touching all deps
                 _pip_install(["torch", "torchvision"],
-                             extra + ["--force-reinstall", "--no-deps"])
-                if _torch_has_cuda():
+                             extra + ["--force-reinstall", "--no-deps"],
+                             python_exe=exe)
+                if _torch_has_cuda(exe):
                     step(f"  CUDA torch installed via {desc}")
                     torch_ok = True
                     break
-                step(f"  {desc}: installed but still CPU-only, trying next index...")
+                step(f"  {desc}: still CPU-only, trying next index...")
             except subprocess.CalledProcessError:
                 step(f"  {desc}: pip failed, trying next index...")
 
         if not torch_ok:
             step("  torch: all CUDA indexes failed, falling back to PyPI...")
             try:
-                _pip_install(["torch", "torchvision"], ["--force-reinstall", "--no-deps"])
+                _pip_install(["torch", "torchvision"],
+                             ["--force-reinstall", "--no-deps"],
+                             python_exe=exe)
             except subprocess.CalledProcessError:
                 err("torch install failed  -  media inference disabled")
 
-    # --- rest of deps ---
     for group in [
         ["diffusers", "transformers", "accelerate", "safetensors", "huggingface_hub"],
         ["imageio[ffmpeg]", "sentencepiece", "protobuf"],
     ]:
         step(f"pip install {group[0]} ...")
         try:
-            _pip_install(group, ["--upgrade"])
+            _pip_install(group, ["--upgrade"], python_exe=exe)
         except subprocess.CalledProcessError as e:
             err(f"pip install {group[0]} failed: {e}")
 
     ok("Media deps ready.")
 
 def _media_loop(coordinator, api_key, agent_id, vram_gb, infer_py_path, hf_token=""):
-    headers        = {"X-API-Key": api_key}
-    deps_installed = False
-    aid_enc        = urlquote(agent_id)
+    headers         = {"X-API-Key": api_key}
+    deps_installed  = False
+    infer_python    = sys.executable   # may be updated to py -3.12 etc. after deps check
+    aid_enc         = urlquote(agent_id)
     last_status_log = 0
-    STATUS_INTERVAL = 60  # print "idle" line at most once per minute
+    STATUS_INTERVAL = 60
 
     print(_c(CYAN, f"  [media] thread started  -  {vram_gb} GB VRAM  -  polling {coordinator}"))
 
@@ -778,18 +810,17 @@ def _media_loop(coordinator, api_key, agent_id, vram_gb, infer_py_path, hf_token
         if not deps_installed:
             print(_c(YELLOW, "  [media] installing deps (first job)..."))
             try:
-                install_media_deps()
-                import importlib, torch as _torch
-                importlib.import_module("diffusers")
-                importlib.import_module("transformers")
-                if not _torch.cuda.is_available():
+                install_media_deps()                   # install for sys.executable first
+                infer_python = _find_cuda_python()     # may fall back to py -3.12 etc.
+                if infer_python != sys.executable:
+                    install_media_deps(infer_python)   # ensure deps present in that env
+                if not _torch_has_cuda(infer_python):
                     raise RuntimeError(
-                        f"torch {_torch.__version__} is CPU-only — "
-                        "will retry CUDA install on next job"
+                        f"no CUDA torch found in any available Python — "
+                        "install torch with CUDA support manually"
                     )
                 deps_installed = True
-                print(_c(GREEN, f"  [media] deps ready  "
-                         f"torch={_torch.__version__}  cuda={_torch.version.cuda}"))
+                print(_c(GREEN, f"  [media] deps ready  python={infer_python}"))
             except Exception as deps_err:
                 print(_c(RED, f"  [media] deps failed: {deps_err}"))
                 try:
@@ -811,7 +842,7 @@ def _media_loop(coordinator, api_key, agent_id, vram_gb, infer_py_path, hf_token
             if job_type == "image":
                 out_dir = tmp_dir / job_id
                 out_dir.mkdir(exist_ok=True)
-                cmd = [sys.executable, str(infer_py_path),
+                cmd = [infer_python, str(infer_py_path),
                        "--type", "image", "--model", model,
                        "--prompt", body["prompt"],
                        "--n", str(body.get("n", 1)),
@@ -843,7 +874,7 @@ def _media_loop(coordinator, api_key, agent_id, vram_gb, infer_py_path, hf_token
                 print(f"  [media] image done {ms/1000:.1f}s  {len(data)/1024**2:.1f} MB")
             else:
                 out_file = str(tmp_dir / f"{job_id}.mp4")
-                cmd = [sys.executable, str(infer_py_path),
+                cmd = [infer_python, str(infer_py_path),
                        "--type", "video", "--model", model,
                        "--prompt", body["prompt"],
                        "--duration", str(body.get("duration", 5)),
