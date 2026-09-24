@@ -484,111 +484,100 @@ def infer(port, body_json, job_id="", coordinator="", api_key=""):
 # media work loop  (runs in a background thread)
 # ---------------------------------------------------------------------------
 MEDIA_INFER_PY = r'''
-import argparse, os, sys, time
+import argparse, os, sys, time, warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
 
-def run_image(model, prompt, neg, out_dir, n, size, quality):
+def _load(model_id, pipeline_cls, dtype, token=None, **kw):
+    return pipeline_cls.from_pretrained(
+        model_id, dtype=dtype, token=token or None, **kw
+    ).to("cuda")
+
+def run_image(model, prompt, neg, out_dir, n, size, quality, token=None):
     import torch
     w, h = map(int, size.split("x"))
     steps, guidance = 30, 7.5
     if model == "flux-schnell":
         from diffusers import FluxPipeline
-        pipe = FluxPipeline.from_pretrained(
-            "black-forest-labs/FLUX.1-schnell", torch_dtype=torch.bfloat16
-        ).to("cuda")
+        pipe = _load("black-forest-labs/FLUX.1-schnell", FluxPipeline, torch.bfloat16, token)
         steps, guidance = 4, 0.0
     elif model == "flux-dev":
         from diffusers import FluxPipeline
-        pipe = FluxPipeline.from_pretrained(
-            "black-forest-labs/FLUX.1-dev", torch_dtype=torch.bfloat16
-        ).to("cuda")
+        pipe = _load("black-forest-labs/FLUX.1-dev", FluxPipeline, torch.bfloat16, token)
         steps, guidance = 20, 3.5
     elif model == "sd3.5-medium":
         from diffusers import StableDiffusion3Pipeline
-        pipe = StableDiffusion3Pipeline.from_pretrained(
-            "stabilityai/stable-diffusion-3.5-medium", torch_dtype=torch.bfloat16
-        ).to("cuda")
+        pipe = _load("stabilityai/stable-diffusion-3.5-medium", StableDiffusion3Pipeline, torch.bfloat16, token)
         steps, guidance = 28, 7.0
     elif model == "sdxl":
         from diffusers import StableDiffusionXLPipeline
-        pipe = StableDiffusionXLPipeline.from_pretrained(
-            "stabilityai/stable-diffusion-xl-base-1.0",
-            torch_dtype=torch.float16, use_safetensors=True, variant="fp16"
-        ).to("cuda")
+        pipe = _load("stabilityai/stable-diffusion-xl-base-1.0", StableDiffusionXLPipeline,
+                     torch.float16, token, use_safetensors=True, variant="fp16")
     else:
         sys.exit(f"Unknown image model: {model}")
     if hasattr(pipe, "enable_model_cpu_offload"):
         pipe.enable_model_cpu_offload()
     os.makedirs(out_dir, exist_ok=True)
     for i in range(n):
-        result = pipe(
-            prompt=prompt, negative_prompt=neg or None,
-            num_inference_steps=steps, guidance_scale=guidance,
-            width=w, height=h,
-        )
+        result = pipe(prompt=prompt, negative_prompt=neg or None,
+                      num_inference_steps=steps, guidance_scale=guidance, width=w, height=h)
         fp = os.path.join(out_dir, f"img_{i}_{int(time.time())}.png")
         result.images[0].save(fp)
         print(fp, flush=True)
 
-def run_video(model, prompt, neg, out_file, duration, width, height):
-    import torch, numpy as np
+def run_video(model, prompt, neg, out_file, duration, width, height, token=None):
+    import torch
     if model == "ltx-video":
         from diffusers import LTXPipeline
-        pipe = LTXPipeline.from_pretrained(
-            "Lightricks/LTX-Video", torch_dtype=torch.bfloat16
-        ).to("cuda")
+        pipe = _load("Lightricks/LTX-Video", LTXPipeline, torch.bfloat16, token)
         result = pipe(prompt=prompt, negative_prompt=neg or None,
                       width=width, height=height,
                       num_frames=duration * 8 + 1, num_inference_steps=50)
     elif model == "cogvideox-2b":
         from diffusers import CogVideoXPipeline
-        pipe = CogVideoXPipeline.from_pretrained(
-            "THUDM/CogVideoX-2b", torch_dtype=torch.bfloat16
-        ).to("cuda")
+        pipe = _load("THUDM/CogVideoX-2b", CogVideoXPipeline, torch.bfloat16, token)
         result = pipe(prompt=prompt, num_inference_steps=50,
                       num_frames=duration * 8, guidance_scale=6)
     elif model == "cogvideox-5b":
         from diffusers import CogVideoXPipeline
-        pipe = CogVideoXPipeline.from_pretrained(
-            "THUDM/CogVideoX-5b", torch_dtype=torch.bfloat16
-        ).to("cuda")
+        pipe = _load("THUDM/CogVideoX-5b", CogVideoXPipeline, torch.bfloat16, token)
         result = pipe(prompt=prompt, num_inference_steps=50,
                       num_frames=duration * 8, guidance_scale=6)
     elif model == "wan-2.1-t2v-1.3b":
         from diffusers import WanPipeline
-        pipe = WanPipeline.from_pretrained(
-            "Wan-AI/Wan2.1-T2V-1.3B-Diffusers", torch_dtype=torch.bfloat16
-        ).to("cuda")
+        pipe = _load("Wan-AI/Wan2.1-T2V-1.3B-Diffusers", WanPipeline, torch.bfloat16, token)
         result = pipe(prompt=prompt, negative_prompt=neg or None,
                       height=height, width=width,
                       num_frames=duration * 16, guidance_scale=5.0)
     else:
         sys.exit(f"Unknown video model: {model}")
     frames = result.frames[0]
-    frames_np = [__import__("numpy").array(f) for f in frames]
-    import imageio
+    import numpy as np, imageio
+    frames_np = [np.array(f) for f in frames]
     os.makedirs(os.path.dirname(os.path.abspath(out_file)), exist_ok=True)
     imageio.mimwrite(out_file, frames_np, fps=8, quality=8)
     print(out_file, flush=True)
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--type",     required=True, choices=["image", "video"])
-    p.add_argument("--model",    required=True)
-    p.add_argument("--prompt",   required=True)
-    p.add_argument("--neg",      default="")
-    p.add_argument("--out-dir",  default=".")
-    p.add_argument("--out-file", default="out.mp4")
-    p.add_argument("--n",        type=int, default=1)
-    p.add_argument("--size",     default="1024x1024")
-    p.add_argument("--quality",  default="standard")
-    p.add_argument("--duration", type=int, default=5)
-    p.add_argument("--width",    type=int, default=512)
-    p.add_argument("--height",   type=int, default=512)
+    p.add_argument("--type",      required=True, choices=["image", "video"])
+    p.add_argument("--model",     required=True)
+    p.add_argument("--prompt",    required=True)
+    p.add_argument("--neg",       default="")
+    p.add_argument("--hf-token",  default="")
+    p.add_argument("--out-dir",   default=".")
+    p.add_argument("--out-file",  default="out.mp4")
+    p.add_argument("--n",         type=int, default=1)
+    p.add_argument("--size",      default="1024x1024")
+    p.add_argument("--quality",   default="standard")
+    p.add_argument("--duration",  type=int, default=5)
+    p.add_argument("--width",     type=int, default=512)
+    p.add_argument("--height",    type=int, default=512)
     a = p.parse_args()
+    tok = a.hf_token or os.environ.get("HF_TOKEN", "")
     if a.type == "image":
-        run_image(a.model, a.prompt, a.neg, a.out_dir, a.n, a.size, a.quality)
+        run_image(a.model, a.prompt, a.neg, a.out_dir, a.n, a.size, a.quality, tok)
     else:
-        run_video(a.model, a.prompt, a.neg, a.out_file, a.duration, a.width, a.height)
+        run_video(a.model, a.prompt, a.neg, a.out_file, a.duration, a.width, a.height, tok)
 '''
 
 def _detect_cuda_index():
@@ -640,6 +629,7 @@ def install_media_deps():
     # --- rest of deps ---
     other = [
         ["diffusers", "transformers", "accelerate", "safetensors", "huggingface_hub"],
+        ["torchvision"],
         ["imageio[ffmpeg]", "sentencepiece", "protobuf"],
     ]
     for group in other:
@@ -651,7 +641,7 @@ def install_media_deps():
 
     ok("Media deps ready.")
 
-def _media_loop(coordinator, api_key, agent_id, vram_gb, infer_py_path):
+def _media_loop(coordinator, api_key, agent_id, vram_gb, infer_py_path, hf_token=""):
     headers        = {"X-API-Key": api_key}
     deps_installed = False
     aid_enc        = urlquote(agent_id)
@@ -715,6 +705,8 @@ def _media_loop(coordinator, api_key, agent_id, vram_gb, infer_py_path):
                            "--out-dir", str(out_dir)]
                     if body.get("negative_prompt"):
                         cmd += ["--neg", body["negative_prompt"]]
+                    if hf_token:
+                        cmd += ["--hf-token", hf_token]
                     proc = subprocess.run(cmd, capture_output=True, text=True,
                                          encoding="utf-8", errors="replace")
                     if proc.returncode != 0:
@@ -745,6 +737,8 @@ def _media_loop(coordinator, api_key, agent_id, vram_gb, infer_py_path):
                            "--out-file", out_file]
                     if body.get("negative_prompt"):
                         cmd += ["--neg", body["negative_prompt"]]
+                    if hf_token:
+                        cmd += ["--hf-token", hf_token]
                     proc = subprocess.run(cmd, capture_output=True, text=True,
                                          encoding="utf-8", errors="replace")
                     if proc.returncode != 0:
@@ -773,7 +767,7 @@ def _media_loop(coordinator, api_key, agent_id, vram_gb, infer_py_path):
             print(_c(YELLOW, f"  [media] [{ts}] coordinator unreachable: {e}  -  retrying in 5s"))
             time.sleep(5)
 
-def start_media_loop(coordinator, api_key, agent_id, vram_gb):
+def start_media_loop(coordinator, api_key, agent_id, vram_gb, hf_token=""):
     tmp_dir    = Path(tempfile.gettempdir()) / "swarm-media"
     tmp_dir.mkdir(exist_ok=True)
     infer_path = tmp_dir / "infer.py"
@@ -781,7 +775,7 @@ def start_media_loop(coordinator, api_key, agent_id, vram_gb):
 
     t = threading.Thread(
         target=_media_loop,
-        args=(coordinator, api_key, agent_id, vram_gb, infer_path),
+        args=(coordinator, api_key, agent_id, vram_gb, infer_path, hf_token),
         daemon=True,
     )
     t.start()
@@ -978,6 +972,9 @@ def main():
     parser.add_argument("--model",           default="")
     parser.add_argument("--port",            type=int, default=11434)
     parser.add_argument("--skip-model-pull", action="store_true")
+    parser.add_argument("--hf-token",        default="",
+                        help="HuggingFace token for gated models (FLUX, SD3). "
+                             "Also read from HF_TOKEN env var.")
     args = parser.parse_args()
 
     _agent_id = get_agent_id()
@@ -1079,8 +1076,9 @@ def main():
     register(args.coordinator, args.api_key, args.port, args.model, hw)
 
     # 8. Media loop (always on; deps installed lazily on first job; skipped if no GPU)
+    hf_token = args.hf_token or os.environ.get("HF_TOKEN", "")
     if hw["vram_gb"] > 0:
-        start_media_loop(args.coordinator, args.api_key, _agent_id, hw["vram_gb"])
+        start_media_loop(args.coordinator, args.api_key, _agent_id, hw["vram_gb"], hf_token)
         ok(f"Media loop ready  ({hw['vram_gb']} GB VRAM)  -  deps install on first job")
 
     # 9. Work loop
