@@ -16,11 +16,7 @@ param(
     [string]$ApiKey       = "",
     [string]$Model        = "",
     [int]$OllamaPort      = 11434,
-    [switch]$SkipModelPull,
-    # Comma-separated list of image/video model IDs this agent will serve.
-    # Example: -MediaModels "flux-schnell,ltx-video"
-    # Leave empty (default) to skip media generation entirely.
-    [string]$MediaModels  = ""
+    [switch]$SkipModelPull
 )
 
 Set-StrictMode -Version Latest
@@ -718,22 +714,21 @@ function Install-MediaDeps {
     Write-Ok "Media deps ready."
 }
 
-function Start-MediaWorkLoop([string]$coordinator, [string]$apiKey, [string]$agentId, [string]$mediaModels, [string]$inferScript) {
+function Start-MediaWorkLoop([string]$coordinator, [string]$apiKey, [string]$agentId, [double]$vramGb, [string]$inferScript) {
     return Start-Job -ScriptBlock {
-        param($coordinator, $apiKey, $agentId, $mediaModels, $inferPy)
+        param($coordinator, $apiKey, $agentId, $vramGb, $inferPy)
 
-        $headers   = @{ "X-API-Key" = $apiKey }
-        $modelList = @($mediaModels -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-        $tmpDir    = Join-Path $env:TEMP "swarm-media"
+        $headers       = @{ "X-API-Key" = $apiKey }
+        $depsInstalled = $false
+        $tmpDir        = Join-Path $env:TEMP "swarm-media"
         if (-not (Test-Path $tmpDir)) { New-Item -ItemType Directory $tmpDir | Out-Null }
         $inferPy | Set-Content (Join-Path $tmpDir "infer.py") -Encoding UTF8
+        $aidEnc = [Uri]::EscapeDataString($agentId)
 
         while ($true) {
             try {
-                $enc  = [Uri]::EscapeDataString($modelList -join ",")
-                $aidEnc = [Uri]::EscapeDataString($agentId)
                 $resp = Invoke-WebRequest `
-                    -Uri "$coordinator/agent/media/jobs/next?models=$enc&agent_id=$aidEnc" `
+                    -Uri "$coordinator/agent/media/jobs/next?vram_gb=$vramGb&agent_id=$aidEnc" `
                     -Method Get -Headers $headers -UseBasicParsing -TimeoutSec 8 -ErrorAction Stop
                 if ($resp.StatusCode -ne 200) { Start-Sleep 3; continue }
 
@@ -743,6 +738,18 @@ function Start-MediaWorkLoop([string]$coordinator, [string]$apiKey, [string]$age
                 $model   = $job.model
                 $body    = $job.body_json | ConvertFrom-Json
                 Write-Host "  [media] $jobType $($jobId.Substring(0,8))  -  $model"
+
+                if (-not $depsInstalled) {
+                    Write-Host "  [media] installing diffusers + torch (first job)..." -ForegroundColor Cyan
+                    $pkgs = @(
+                        @("torch", "--index-url", "https://download.pytorch.org/whl/cu121"),
+                        @("diffusers"), @("transformers"), @("accelerate"),
+                        @("imageio[ffmpeg]"), @("sentencepiece"), @("protobuf")
+                    )
+                    foreach ($pkg in $pkgs) { python -m pip install --quiet @pkg }
+                    $depsInstalled = $true
+                    Write-Host "  [media] deps ready." -ForegroundColor Green
+                }
 
                 $t0    = [DateTime]::UtcNow
                 $outDir = Join-Path $tmpDir $jobId
@@ -800,7 +807,7 @@ function Start-MediaWorkLoop([string]$coordinator, [string]$apiKey, [string]$age
                 }
             } catch { Start-Sleep 3 }
         }
-    } -ArgumentList $coordinator, $apiKey, $agentId, $mediaModels, $inferScript
+    } -ArgumentList $coordinator, $apiKey, $agentId, $vramGb, $inferScript
 }
 
 function Start-WorkLoop([string]$coordinator, [string]$apiKey, [string]$ip, [int]$port, [double]$vramGb) {
@@ -831,7 +838,7 @@ function Start-WorkLoop([string]$coordinator, [string]$apiKey, [string]$ip, [int
                 Receive-Job $script:mediaJob 2>$null | ForEach-Object { Write-Host "  [media] $_" }
                 Remove-Job $script:mediaJob -Force -ErrorAction SilentlyContinue
                 Write-Host "  [media] loop exited ($ms), restarting..." -ForegroundColor Yellow
-                $script:mediaJob = Start-MediaWorkLoop $coordinator $apiKey $script:AgentId $script:MediaModels $script:MEDIA_INFER_PY
+                $script:mediaJob = Start-MediaWorkLoop $coordinator $apiKey $script:AgentId $script:VramGb $script:MEDIA_INFER_PY
             }
         }
 
@@ -1092,14 +1099,12 @@ $script:hw = $hw   # make available to work loop for re-registration
 Write-Status "REGISTERING" ""
 $myIp = Register-WithCoordinator $Coordinator $ApiKey $OllamaPort $Model $hw
 
-# 8. Start optional media work loop (runs in parallel background job)
-$script:mediaJob    = $null
-$script:MediaModels = $MediaModels
-if ($MediaModels) {
-    Write-Step "Media generation enabled: $MediaModels"
-    Install-MediaDeps
-    $script:mediaJob = Start-MediaWorkLoop $Coordinator $ApiKey $script:AgentId $MediaModels $script:MEDIA_INFER_PY
-    Write-Ok "Media loop started (job $($script:mediaJob.Id))  -  polling $Coordinator/agent/media/jobs/next"
+# 8. Media loop (always on if GPU present; deps install lazily on first job)
+$script:mediaJob = $null
+$script:VramGb   = $hw.vram_gb
+if ($hw.vram_gb -gt 0) {
+    $script:mediaJob = Start-MediaWorkLoop $Coordinator $ApiKey $script:AgentId $hw.vram_gb $script:MEDIA_INFER_PY
+    Write-Ok "Media loop ready ($($hw.vram_gb) GB VRAM)  -  deps install on first job"
 }
 
 # 9. Work loop  -  dynamically discovers queued models from coordinator and pulls on demand

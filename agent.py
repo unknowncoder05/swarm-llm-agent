@@ -609,14 +609,14 @@ def install_media_deps():
             err(f"pip install {pkg[0]} failed: {e}")
     ok("Media deps ready.")
 
-def _media_loop(coordinator, api_key, agent_id, model_list, infer_py_path):
-    headers = {"X-API-Key": api_key}
+def _media_loop(coordinator, api_key, agent_id, vram_gb, infer_py_path):
+    headers        = {"X-API-Key": api_key}
+    deps_installed = False
+    aid_enc        = urlquote(agent_id)
     while True:
         try:
-            enc     = urlquote(",".join(model_list))
-            aid_enc = urlquote(agent_id)
             r = requests.get(
-                f"{coordinator}/agent/media/jobs/next?models={enc}&agent_id={aid_enc}",
+                f"{coordinator}/agent/media/jobs/next?vram_gb={vram_gb}&agent_id={aid_enc}",
                 headers=headers, timeout=8
             )
             if r.status_code != 200:
@@ -629,6 +629,10 @@ def _media_loop(coordinator, api_key, agent_id, model_list, infer_py_path):
             model    = job["model"]
             body     = json.loads(job["body_json"])
             print(f"  [media] {job_type} {job_id[:8]}  -  {model}")
+
+            if not deps_installed:
+                install_media_deps()
+                deps_installed = True
 
             tmp_dir = Path(tempfile.gettempdir()) / "swarm-media"
             tmp_dir.mkdir(exist_ok=True)
@@ -703,16 +707,15 @@ def _media_loop(coordinator, api_key, agent_id, model_list, infer_py_path):
         except Exception:
             time.sleep(3)
 
-def start_media_loop(coordinator, api_key, agent_id, media_models):
-    model_list  = [m.strip() for m in media_models.split(",") if m.strip()]
-    tmp_dir     = Path(tempfile.gettempdir()) / "swarm-media"
+def start_media_loop(coordinator, api_key, agent_id, vram_gb):
+    tmp_dir    = Path(tempfile.gettempdir()) / "swarm-media"
     tmp_dir.mkdir(exist_ok=True)
-    infer_path  = tmp_dir / "infer.py"
+    infer_path = tmp_dir / "infer.py"
     infer_path.write_text(MEDIA_INFER_PY, encoding="utf-8")
 
     t = threading.Thread(
         target=_media_loop,
-        args=(coordinator, api_key, agent_id, model_list, infer_path),
+        args=(coordinator, api_key, agent_id, vram_gb, infer_path),
         daemon=True,
     )
     t.start()
@@ -904,13 +907,11 @@ def main():
     global _coordinator, _api_key, _model, _agent_id, _hw
 
     parser = argparse.ArgumentParser(description="swarm-llm agent")
-    parser.add_argument("--coordinator",    default="")
-    parser.add_argument("--api-key",        default="")
-    parser.add_argument("--model",          default="")
-    parser.add_argument("--port",           type=int, default=11434)
+    parser.add_argument("--coordinator",     default="")
+    parser.add_argument("--api-key",         default="")
+    parser.add_argument("--model",           default="")
+    parser.add_argument("--port",            type=int, default=11434)
     parser.add_argument("--skip-model-pull", action="store_true")
-    parser.add_argument("--media-models",   default="",
-                        help="Comma-separated media model IDs, e.g. flux-schnell,ltx-video")
     args = parser.parse_args()
 
     _agent_id = get_agent_id()
@@ -1011,12 +1012,10 @@ def main():
     write_status("REGISTERING", "")
     register(args.coordinator, args.api_key, args.port, args.model, hw)
 
-    # 8. Optional media loop
-    if args.media_models:
-        step(f"Media generation enabled: {args.media_models}")
-        install_media_deps()
-        start_media_loop(args.coordinator, args.api_key, _agent_id, args.media_models)
-        ok(f"Media loop started  -  polling {args.coordinator}/agent/media/jobs/next")
+    # 8. Media loop (always on; deps installed lazily on first job; skipped if no GPU)
+    if hw["vram_gb"] > 0:
+        start_media_loop(args.coordinator, args.api_key, _agent_id, hw["vram_gb"])
+        ok(f"Media loop ready  ({hw['vram_gb']} GB VRAM)  -  deps install on first job")
 
     # 9. Work loop
     work_loop(ollama_exe, args.coordinator, args.api_key, args.port, hw["vram_gb"])
