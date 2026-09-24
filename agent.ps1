@@ -9,32 +9,150 @@
     .\agent.ps1
 
     # Non-interactive (CI / scripted):
-    .\agent.ps1 -Coordinator https://1.2.3.4:8443 -ApiKey abc123 -Model qwen2.5-coder:7b
+    .\agent.ps1 -Coordinator https://1.2.3.4:8443 -ApiKey abc123 -Model devstral-small-2:24b
 #>
 param(
-    [string]$Coordinator = "",
-    [string]$ApiKey      = "",
-    [string]$Model       = "",
-    [int]$OllamaPort     = 11434,
-    [switch]$SkipModelPull
+    [string]$Coordinator  = "",
+    [string]$ApiKey       = "",
+    [string]$Model        = "",
+    [int]$OllamaPort      = 11434,
+    [switch]$SkipModelPull,
+    # Comma-separated list of image/video model IDs this agent will serve.
+    # Example: -MediaModels "flux-schnell,ltx-video"
+    # Leave empty (default) to skip media generation entirely.
+    [string]$MediaModels  = ""
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-# Allow self-signed TLS (PS5 compatible — SkipCertificateCheck is PS6+ only)
-if (-not ([System.Management.Automation.PSTypeName]'TrustAllCerts').Type) {
-    Add-Type -TypeDefinition @"
-using System.Net;
-using System.Security.Cryptography.X509Certificates;
-public class TrustAllCerts : ICertificatePolicy {
-    public bool CheckValidationResult(
-        ServicePoint sp, X509Certificate cert, WebRequest req, int err) { return true; }
-}
-"@
-}
-[System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCerts
-[System.Net.ServicePointManager]::SecurityProtocol  = [System.Net.SecurityProtocolType]::Tls12
+# Require TLS 1.2+ and validate certificates normally (no self-signed bypass).
+[System.Net.ServicePointManager]::SecurityProtocol = (
+    [System.Net.SecurityProtocolType]::Tls12 -bor
+    [System.Net.SecurityProtocolType]::Tls13
+)
+
+# ── media inference script (embedded Python — written to disk when needed) ────
+# Single-quoted here-string: no PowerShell variable interpolation.
+
+$script:MEDIA_INFER_PY = @'
+import argparse, os, sys, time
+
+def run_image(model, prompt, neg, out_dir, n, size, quality):
+    import torch
+    w, h = map(int, size.split("x"))
+    steps, guidance = 30, 7.5
+    if model == "flux-schnell":
+        from diffusers import FluxPipeline
+        pipe = FluxPipeline.from_pretrained(
+            "black-forest-labs/FLUX.1-schnell", torch_dtype=torch.bfloat16
+        ).to("cuda")
+        steps, guidance = 4, 0.0
+    elif model == "flux-dev":
+        from diffusers import FluxPipeline
+        pipe = FluxPipeline.from_pretrained(
+            "black-forest-labs/FLUX.1-dev", torch_dtype=torch.bfloat16
+        ).to("cuda")
+        steps, guidance = 20, 3.5
+    elif model == "sd3.5-medium":
+        from diffusers import StableDiffusion3Pipeline
+        pipe = StableDiffusion3Pipeline.from_pretrained(
+            "stabilityai/stable-diffusion-3.5-medium", torch_dtype=torch.bfloat16
+        ).to("cuda")
+        steps, guidance = 28, 7.0
+    elif model == "sdxl":
+        from diffusers import StableDiffusionXLPipeline
+        pipe = StableDiffusionXLPipeline.from_pretrained(
+            "stabilityai/stable-diffusion-xl-base-1.0",
+            torch_dtype=torch.float16, use_safetensors=True, variant="fp16"
+        ).to("cuda")
+    else:
+        sys.exit(f"Unknown image model: {model}")
+    if hasattr(pipe, "enable_model_cpu_offload"):
+        pipe.enable_model_cpu_offload()
+    os.makedirs(out_dir, exist_ok=True)
+    for i in range(n):
+        result = pipe(
+            prompt=prompt,
+            negative_prompt=neg or None,
+            num_inference_steps=steps,
+            guidance_scale=guidance,
+            width=w, height=h,
+        )
+        fp = os.path.join(out_dir, f"img_{i}_{int(time.time())}.png")
+        result.images[0].save(fp)
+        print(fp, flush=True)
+
+def run_video(model, prompt, neg, out_file, duration, width, height):
+    import torch, numpy as np
+    if model == "ltx-video":
+        from diffusers import LTXPipeline
+        pipe = LTXPipeline.from_pretrained(
+            "Lightricks/LTX-Video", torch_dtype=torch.bfloat16
+        ).to("cuda")
+        result = pipe(
+            prompt=prompt, negative_prompt=neg or None,
+            width=width, height=height,
+            num_frames=duration * 8 + 1,
+            num_inference_steps=50,
+        )
+    elif model == "cogvideox-2b":
+        from diffusers import CogVideoXPipeline
+        pipe = CogVideoXPipeline.from_pretrained(
+            "THUDM/CogVideoX-2b", torch_dtype=torch.bfloat16
+        ).to("cuda")
+        result = pipe(
+            prompt=prompt, num_inference_steps=50,
+            num_frames=duration * 8, guidance_scale=6,
+        )
+    elif model == "cogvideox-5b":
+        from diffusers import CogVideoXPipeline
+        pipe = CogVideoXPipeline.from_pretrained(
+            "THUDM/CogVideoX-5b", torch_dtype=torch.bfloat16
+        ).to("cuda")
+        result = pipe(
+            prompt=prompt, num_inference_steps=50,
+            num_frames=duration * 8, guidance_scale=6,
+        )
+    elif model == "wan-2.1-t2v-1.3b":
+        from diffusers import WanPipeline
+        pipe = WanPipeline.from_pretrained(
+            "Wan-AI/Wan2.1-T2V-1.3B-Diffusers", torch_dtype=torch.bfloat16
+        ).to("cuda")
+        result = pipe(
+            prompt=prompt, negative_prompt=neg or None,
+            height=height, width=width,
+            num_frames=duration * 16, guidance_scale=5.0,
+        )
+    else:
+        sys.exit(f"Unknown video model: {model}")
+    frames = result.frames[0]
+    frames_np = [np.array(f) for f in frames]
+    import imageio
+    os.makedirs(os.path.dirname(os.path.abspath(out_file)), exist_ok=True)
+    imageio.mimwrite(out_file, frames_np, fps=8, quality=8)
+    print(out_file, flush=True)
+
+if __name__ == "__main__":
+    p = argparse.ArgumentParser()
+    p.add_argument("--type",    required=True, choices=["image","video"])
+    p.add_argument("--model",   required=True)
+    p.add_argument("--prompt",  required=True)
+    p.add_argument("--neg",     default="")
+    p.add_argument("--out-dir", default=".")
+    p.add_argument("--out-file",default="out.mp4")
+    p.add_argument("--n",       type=int, default=1)
+    p.add_argument("--size",    default="1024x1024")
+    p.add_argument("--quality", default="standard")
+    p.add_argument("--duration",type=int, default=5)
+    p.add_argument("--width",   type=int, default=512)
+    p.add_argument("--height",  type=int, default=512)
+    a = p.parse_args()
+    if a.type == "image":
+        run_image(a.model, a.prompt, a.neg, a.out_dir, a.n, a.size, a.quality)
+    else:
+        run_video(a.model, a.prompt, a.neg, a.out_file, a.duration, a.width, a.height)
+'@
 
 # ── console helpers ───────────────────────────────────────────────────────────
 
@@ -139,34 +257,22 @@ function Get-HardwareQuick {
 
 # Pick recommended model index based on VRAM
 function Get-RecommendedModelIndex([double]$vramGb) {
-    if     ($vramGb -ge 18) { return 10 } # qwen3.6:27b  — best coding 2026, 18+ GB
-    elseif ($vramGb -ge 16) { return 9  } # devstral-small-2:24b — best agentic coding
-    elseif ($vramGb -ge 12) { return 8  } # qwen3:14b   — best tool-use, 12+ GB
-    elseif ($vramGb -ge 8)  { return 7  } # gemma4:12b  — best general 2026, 8+ GB
-    elseif ($vramGb -ge 6)  { return 5  } # ministral-3:8b — fast general, 6+ GB
-    elseif ($vramGb -ge 4)  { return 3  } # qwen2.5-coder:7b
-    elseif ($vramGb -ge 3)  { return 2  } # qwen2.5-coder:3b
-    elseif ($vramGb -ge 1)  { return 1  } # qwen2.5-coder:1.5b
-    else                    { return 0  } # 0.5b (CPU / unknown)
+    if     ($vramGb -ge 18) { return 4 } # qwen3.6:27b         — best coding 2026, 18+ GB
+    elseif ($vramGb -ge 16) { return 3 } # devstral-small-2:24b — best agentic coding
+    elseif ($vramGb -ge 12) { return 2 } # qwen3:14b            — excellent tool use, 12+ GB
+    elseif ($vramGb -ge 8)  { return 1 } # gemma4:12b           — strong general, 8+ GB
+    else                    { return 0 } # qwen3:8b             — minimum capable agentic model
 }
 
 # VRAM required for a given model. Falls back to a heuristic for unknown models.
 function Get-ModelVram([string]$model) {
     $known = @{
         "devstral-small-2:24b" = 15.0
-        "devstral:24b"         = 15.0
         "qwen3.6:27b"          = 17.0
         "qwen3:30b-a3b"        = 17.0
         "qwen3:14b"            =  9.3
-        "qwen2.5-coder:14b"    =  9.0
-        "deepseek-r1:14b"      =  9.0
         "gemma4:12b"           =  8.0
-        "ministral-3:8b"       =  5.2
         "qwen3:8b"             =  5.2
-        "qwen2.5-coder:7b"     =  4.7
-        "qwen2.5-coder:3b"     =  2.0
-        "qwen2.5-coder:1.5b"   =  1.0
-        "qwen2.5-coder:0.5b"   =  0.4
     }
     if ($known.ContainsKey($model)) { return $known[$model] }
     if ($model -match ':(\d+\.?\d*)b') { return [math]::Round([double]$Matches[1] * 0.65, 1) }
@@ -174,25 +280,16 @@ function Get-ModelVram([string]$model) {
 }
 
 # All model IDs this machine can serve given its VRAM.
-# CPU-only machines (vramGb=0) accept small models that run on RAM.
 function Get-ModelCandidates([double]$vramGb) {
     $catalog = @(
-        @{ id="qwen2.5-coder:0.5b";    vram=0.4  },
-        @{ id="qwen2.5-coder:1.5b";    vram=1.0  },
-        @{ id="qwen2.5-coder:3b";      vram=2.0  },
-        @{ id="qwen2.5-coder:7b";      vram=4.7  },
-        @{ id="qwen2.5-coder:14b";     vram=9.0  },
-        @{ id="ministral-3:8b";        vram=5.2  },
-        @{ id="qwen3:8b";              vram=5.2  },
-        @{ id="gemma4:12b";            vram=8.0  },
-        @{ id="qwen3:14b";             vram=9.3  },
-        @{ id="devstral-small-2:24b";  vram=15.0 },
-        @{ id="devstral:24b";          vram=15.0 },
-        @{ id="qwen3.6:27b";           vram=17.0 },
-        @{ id="qwen3:30b-a3b";         vram=17.0 },
-        @{ id="deepseek-r1:14b";       vram=9.0  }
+        @{ id="qwen3:8b";             vram=5.2  },
+        @{ id="gemma4:12b";           vram=8.0  },
+        @{ id="qwen3:14b";            vram=9.3  },
+        @{ id="devstral-small-2:24b"; vram=15.0 },
+        @{ id="qwen3.6:27b";          vram=17.0 },
+        @{ id="qwen3:30b-a3b";        vram=17.0 }
     )
-    $limit = if ($vramGb -le 0) { 8.0 } else { $vramGb - 1.0 }
+    $limit = if ($vramGb -le 0) { 6.0 } else { $vramGb - 1.0 }
     return @($catalog | Where-Object { $_.vram -le $limit } | ForEach-Object { $_.id })
 }
 
@@ -236,19 +333,11 @@ function Get-OllamaParallel([double]$vramGb, [string]$model) {
     if ($vramGb -le 0) { return 1 }  # CPU inference — no benefit from parallelism
     $modelVram = switch -Wildcard ($model) {
         "devstral-small-2:24b" { 15 }
-        "devstral:24b"         { 15 }
         "qwen3.6:27b"          { 17 }
         "qwen3:30b*"           { 17 }
-        "gemma4:12b"           { 8  }
-        "qwen3:14b"            { 9  }
-        "qwen2.5-coder:14b"    { 9  }
-        "deepseek-r1:14b"      { 9  }
-        "ministral-3:8b"       { 5  }
-        "qwen3:8b"             { 5  }
-        "qwen2.5-coder:7b"     { 5  }
-        "qwen2.5-coder:3b"     { 2  }
-        "qwen2.5-coder:1.5b"   { 1  }
-        "qwen2.5-coder:0.5b"   { 1  }
+        "qwen3:14b"            {  9 }
+        "gemma4:12b"           {  8 }
+        "qwen3:8b"             {  5 }
         default                { [math]::Ceiling($vramGb * 0.65) }
     }
     # Headroom after weights and 2 GB driver/OS overhead
@@ -466,7 +555,7 @@ function Write-Status([string]$phase, [string]$detail = "") {
     }
 }
 
-function Invoke-InferWithMascot([int]$port, [string]$bodyJson) {
+function Invoke-InferWithMascot([int]$port, [string]$bodyJson, [string]$jobId = "", [string]$coordinator = "", [hashtable]$cancelHeaders = @{}) {
     $eyeFrames   = @("o . o","@ . @","o . o","> . <","o . o","^ . ^","o . o","* . *")
     $mouthFrames = @(" ___ "," --- "," ~~~ "," ... "," ### ")
     $spinners    = @("-","\","|","/")
@@ -502,8 +591,9 @@ function Invoke-InferWithMascot([int]$port, [string]$bodyJson) {
     $mascotTop = [Console]::CursorTop - 5
     [Console]::CursorVisible = $false
 
-    $frame = 0
-    $t0    = [DateTime]::UtcNow
+    $frame           = 0
+    $t0              = [DateTime]::UtcNow
+    $lastCancelCheck = [DateTime]::MinValue
 
     while ($inferJob.State -eq 'Running') {
         $elapsed = [math]::Floor(([DateTime]::UtcNow - $t0).TotalSeconds)
@@ -518,6 +608,26 @@ function Invoke-InferWithMascot([int]$port, [string]$bodyJson) {
         Write-Host "   |   $mouth   |   $spin  ${elapsed}s" -ForegroundColor DarkCyan
         Write-Host "   '-----------'   " -ForegroundColor DarkCyan
         Write-Host "  [$think]  " -ForegroundColor DarkGray
+
+        # Poll coordinator for cancellation every ~5 seconds
+        if ($jobId -and $coordinator -and ([DateTime]::UtcNow - $lastCancelCheck).TotalSeconds -ge 5) {
+            $lastCancelCheck = [DateTime]::UtcNow
+            try {
+                $cr = Invoke-RestMethod -Uri "$coordinator/agent/jobs/$jobId/cancelled" `
+                    -Method Get -Headers $cancelHeaders -TimeoutSec 3 -ErrorAction Stop
+                if ($cr.cancelled) {
+                    Stop-Job  $inferJob -ErrorAction SilentlyContinue
+                    Remove-Job $inferJob -Force -ErrorAction SilentlyContinue
+                    [Console]::SetCursorPosition(0, $mascotTop)
+                    1..5 | ForEach-Object { Write-Host ("".PadRight(60)) }
+                    [Console]::SetCursorPosition(0, $mascotTop)
+                    [Console]::CursorVisible = $true
+                    throw "Job $jobId cancelled by coordinator (consumer disconnected or timed out)"
+                }
+            } catch [System.Management.Automation.RuntimeException] {
+                throw  # re-throw our own "cancelled" exception
+            } catch { }  # network hiccup — keep running, coordinator will clean up
+        }
 
         Start-Sleep -Milliseconds 150
         $frame++
@@ -582,6 +692,117 @@ function Invoke-ModelPull([string]$modelName, [int]$port) {
     Write-Ok "Model '$modelName' ready."
 }
 
+# ── media helpers ─────────────────────────────────────────────────────────────
+
+function Install-MediaDeps {
+    Write-Step "Checking media generation dependencies (Python + diffusers)..."
+    $py = Get-Command python -ErrorAction SilentlyContinue
+    if (-not $py) { $py = Get-Command python3 -ErrorAction SilentlyContinue }
+    if (-not $py) { throw "Python 3.10+ required for media generation — install it and add to PATH" }
+    Write-Step "Python: $($py.Source)"
+
+    $pkgs = @(
+        "torch --index-url https://download.pytorch.org/whl/cu121",
+        "diffusers",
+        "transformers",
+        "accelerate",
+        "imageio[ffmpeg]",
+        "sentencepiece",
+        "protobuf"
+    )
+    foreach ($pkg in $pkgs) {
+        Write-Step "pip install $($pkg.Split(' ')[0]) ..."
+        $args = @("-m","pip","install","--quiet") + $pkg.Split(" ")
+        & python @args 2>&1 | Where-Object { $_ -match 'error|ERROR' } | ForEach-Object { Write-Host $_ -ForegroundColor Yellow }
+    }
+    Write-Ok "Media deps ready."
+}
+
+function Start-MediaWorkLoop([string]$coordinator, [string]$apiKey, [string]$agentId, [string]$mediaModels, [string]$inferScript) {
+    return Start-Job -ScriptBlock {
+        param($coordinator, $apiKey, $agentId, $mediaModels, $inferPy)
+
+        $headers   = @{ "X-API-Key" = $apiKey }
+        $modelList = @($mediaModels -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        $tmpDir    = Join-Path $env:TEMP "swarm-media"
+        if (-not (Test-Path $tmpDir)) { New-Item -ItemType Directory $tmpDir | Out-Null }
+        $inferPy | Set-Content (Join-Path $tmpDir "infer.py") -Encoding UTF8
+
+        while ($true) {
+            try {
+                $enc  = [Uri]::EscapeDataString($modelList -join ",")
+                $aidEnc = [Uri]::EscapeDataString($agentId)
+                $resp = Invoke-WebRequest `
+                    -Uri "$coordinator/agent/media/jobs/next?models=$enc&agent_id=$aidEnc" `
+                    -Method Get -Headers $headers -UseBasicParsing -TimeoutSec 8 -ErrorAction Stop
+                if ($resp.StatusCode -ne 200) { Start-Sleep 3; continue }
+
+                $job     = $resp.Content | ConvertFrom-Json
+                $jobId   = $job.id
+                $jobType = $job.type
+                $model   = $job.model
+                $body    = $job.body_json | ConvertFrom-Json
+                Write-Host "  [media] $jobType $($jobId.Substring(0,8)) — $model"
+
+                $t0    = [DateTime]::UtcNow
+                $outDir = Join-Path $tmpDir $jobId
+                try {
+                    if ($jobType -eq "image") {
+                        New-Item -ItemType Directory $outDir -Force | Out-Null
+                        $pyArgs = @("--type","image","--model",$model,
+                                    "--prompt",$body.prompt,
+                                    "--n","$($body.n)",
+                                    "--size",$body.size,
+                                    "--quality",$body.quality,
+                                    "--out-dir",$outDir)
+                        if ($body.negative_prompt) { $pyArgs += @("--neg",$body.negative_prompt) }
+                        $pyOut = python (Join-Path $tmpDir "infer.py") @pyArgs 2>&1
+                        if ($LASTEXITCODE -ne 0) { throw "inference error: $($pyOut -join ' ')" }
+                        $outPaths = @($pyOut | Where-Object { $_ -and (Test-Path "$_") })
+                        if ($outPaths.Count -eq 0) { throw "no output files produced" }
+                        $outFile  = $outPaths[0]
+                        $ms       = [math]::Round(([DateTime]::UtcNow - $t0).TotalMilliseconds)
+                        $ext      = [IO.Path]::GetExtension($outFile).TrimStart(".")
+                        $data     = [IO.File]::ReadAllBytes($outFile)
+                        Invoke-RestMethod `
+                            -Uri "$coordinator/agent/media/jobs/$jobId/result?job_type=image&ext=$ext&elapsed_ms=$ms" `
+                            -Method Post -Body $data -ContentType "application/octet-stream" `
+                            -Headers $headers -TimeoutSec 120 -ErrorAction Stop | Out-Null
+                        Write-Host "  [media] image done $([math]::Round($ms/1000,1))s  $([math]::Round($data.Length/1MB,1)) MB"
+                    } else {
+                        $outFile  = Join-Path $tmpDir "$jobId.mp4"
+                        $pyArgs   = @("--type","video","--model",$model,
+                                      "--prompt",$body.prompt,
+                                      "--duration","$($body.duration)",
+                                      "--width","$($body.width)",
+                                      "--height","$($body.height)",
+                                      "--out-file",$outFile)
+                        if ($body.negative_prompt) { $pyArgs += @("--neg",$body.negative_prompt) }
+                        $pyOut = python (Join-Path $tmpDir "infer.py") @pyArgs 2>&1
+                        if ($LASTEXITCODE -ne 0) { throw "inference error: $($pyOut -join ' ')" }
+                        $ms   = [math]::Round(([DateTime]::UtcNow - $t0).TotalMilliseconds)
+                        $data = [IO.File]::ReadAllBytes($outFile)
+                        Invoke-RestMethod `
+                            -Uri "$coordinator/agent/media/jobs/$jobId/result?job_type=video&ext=mp4&elapsed_ms=$ms" `
+                            -Method Post -Body $data -ContentType "application/octet-stream" `
+                            -Headers $headers -TimeoutSec 600 -ErrorAction Stop | Out-Null
+                        Write-Host "  [media] video done $([math]::Round($ms/1000,1))s  $([math]::Round($data.Length/1MB,1)) MB"
+                    }
+                } catch {
+                    $err = "$_"
+                    Write-Host "  [media] job $jobId failed: $err"
+                    try {
+                        Invoke-RestMethod `
+                            -Uri "$coordinator/agent/media/jobs/$jobId/error?job_type=$jobType" `
+                            -Method Post -Body (@{error=$err}|ConvertTo-Json) `
+                            -ContentType "application/json" -Headers $headers -ErrorAction SilentlyContinue | Out-Null
+                    } catch { }
+                }
+            } catch { Start-Sleep 3 }
+        }
+    } -ArgumentList $coordinator, $apiKey, $agentId, $mediaModels, $inferScript
+}
+
 function Start-WorkLoop([string]$coordinator, [string]$apiKey, [string]$ip, [int]$port, [double]$vramGb) {
     $headers    = @{ "X-API-Key" = $apiKey }
     $lastHB     = [DateTime]::MinValue
@@ -603,6 +824,17 @@ function Start-WorkLoop([string]$coordinator, [string]$apiKey, [string]$ip, [int
 
     Write-Status "RUNNING" "accepting any model that fits in $vramGb GB VRAM — Ctrl+C to quit"
     while ($true) {
+        # Restart media job if it exited unexpectedly
+        if ($script:mediaJob) {
+            $ms = $script:mediaJob.State
+            if ($ms -eq "Failed" -or $ms -eq "Completed") {
+                Receive-Job $script:mediaJob 2>$null | ForEach-Object { Write-Host "  [media] $_" }
+                Remove-Job $script:mediaJob -Force -ErrorAction SilentlyContinue
+                Write-Host "  [media] loop exited ($ms), restarting..." -ForegroundColor Yellow
+                $script:mediaJob = Start-MediaWorkLoop $coordinator $apiKey $script:AgentId $script:MediaModels $script:MEDIA_INFER_PY
+            }
+        }
+
         # heartbeat every 15s — re-register automatically if coordinator restarted
         if (([DateTime]::UtcNow - $lastHB).TotalSeconds -ge 15) {
             try {
@@ -675,7 +907,7 @@ function Start-WorkLoop([string]$coordinator, [string]$apiKey, [string]$ip, [int
 
                 $t0 = [DateTime]::UtcNow
                 try {
-                    $rawResult = Invoke-InferWithMascot -port $port -bodyJson $jobBodyJson
+                    $rawResult = Invoke-InferWithMascot -port $port -bodyJson $jobBodyJson -jobId $jobId -coordinator $coordinator -cancelHeaders $headers
                     $ms        = [math]::Round(([DateTime]::UtcNow - $t0).TotalMilliseconds, 1)
                     $postBody  = "{`"result`":$rawResult,`"elapsed_ms`":$ms}"
                     Invoke-RestMethod -Uri "$coordinator/agent/jobs/$jobId/result" `
@@ -728,19 +960,12 @@ function Start-Wizard {
     # Model selection
     # Auto-select default model based on VRAM (downloaded at startup; others pulled on demand)
     $modelIds = @(
-        "qwen2.5-coder:0.5b",
-        "qwen2.5-coder:1.5b",
-        "qwen2.5-coder:3b",
-        "qwen2.5-coder:7b",
-        "qwen2.5-coder:14b",
-        "ministral-3:8b",
         "qwen3:8b",
         "gemma4:12b",
         "qwen3:14b",
         "devstral-small-2:24b",
         "qwen3.6:27b",
-        "qwen3:30b-a3b",
-        "deepseek-r1:14b"
+        "qwen3:30b-a3b"
     )
     $recIdx   = Get-RecommendedModelIndex $hw.vram_gb
     $chosenId = $modelIds[$recIdx]
@@ -867,5 +1092,15 @@ $script:hw = $hw   # make available to work loop for re-registration
 Write-Status "REGISTERING" ""
 $myIp = Register-WithCoordinator $Coordinator $ApiKey $OllamaPort $Model $hw
 
-# 8. Work loop — dynamically discovers queued models from coordinator and pulls on demand
+# 8. Start optional media work loop (runs in parallel background job)
+$script:mediaJob    = $null
+$script:MediaModels = $MediaModels
+if ($MediaModels) {
+    Write-Step "Media generation enabled: $MediaModels"
+    Install-MediaDeps
+    $script:mediaJob = Start-MediaWorkLoop $Coordinator $ApiKey $script:AgentId $MediaModels $script:MEDIA_INFER_PY
+    Write-Ok "Media loop started (job $($script:mediaJob.Id)) — polling $Coordinator/agent/media/jobs/next"
+}
+
+# 9. Work loop — dynamically discovers queued models from coordinator and pulls on demand
 Start-WorkLoop $Coordinator $ApiKey $myIp $OllamaPort $hw.vram_gb
