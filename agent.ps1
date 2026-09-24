@@ -5,7 +5,7 @@
     it with a swarm-llm coordinator.
 
 .EXAMPLE
-    # Interactive wizard (recommended — auto-detects hardware, shows model menu):
+    # Interactive wizard (recommended  -  auto-detects hardware, shows model menu):
     .\agent.ps1
 
     # Non-interactive (CI / scripted):
@@ -32,7 +32,7 @@ $ErrorActionPreference = "Stop"
     [System.Net.SecurityProtocolType]::Tls13
 )
 
-# ── media inference script (embedded Python — written to disk when needed) ────
+# -- media inference script (embedded Python  -  written to disk when needed) ----
 # Single-quoted here-string: no PowerShell variable interpolation.
 
 $script:MEDIA_INFER_PY = @'
@@ -154,7 +154,7 @@ if __name__ == "__main__":
         run_video(a.model, a.prompt, a.neg, a.out_file, a.duration, a.width, a.height)
 '@
 
-# ── console helpers ───────────────────────────────────────────────────────────
+# -- console helpers -----------------------------------------------------------
 
 function Write-Step([string]$msg) { Write-Host "[*] $msg" -ForegroundColor Cyan }
 function Write-Ok([string]$msg)   { Write-Host "[+] $msg" -ForegroundColor Green }
@@ -163,12 +163,12 @@ function Write-Err([string]$msg)  { Write-Host "[!] $msg" -ForegroundColor Red }
 function Show-Banner {
     Clear-Host
     Write-Host ""
-    Write-Host "  ███████╗██╗    ██╗ █████╗ ██████╗ ███╗   ███╗    ██╗     ██╗     ███╗   ███╗" -ForegroundColor Cyan
-    Write-Host "  ██╔════╝██║    ██║██╔══██╗██╔══██╗████╗ ████║    ██║     ██║     ████╗ ████║" -ForegroundColor Cyan
-    Write-Host "  ███████╗██║ █╗ ██║███████║██████╔╝██╔████╔██║    ██║     ██║     ██╔████╔██║" -ForegroundColor Cyan
-    Write-Host "  ╚════██║██║███╗██║██╔══██║██╔══██╗██║╚██╔╝██║    ██║     ██║     ██║╚██╔╝██║" -ForegroundColor Cyan
-    Write-Host "  ███████║╚███╔███╔╝██║  ██║██║  ██║██║ ╚═╝ ██║    ███████╗███████╗██║ ╚═╝ ██║" -ForegroundColor Cyan
-    Write-Host "  ╚══════╝ ╚══╝╚══╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝    ╚══════╝╚══════╝╚═╝     ╚═╝" -ForegroundColor Cyan
+    Write-Host "  #######+##+    ##+ #####+ ######+ ###+   ###+    ##+     ##+     ###+   ###+" -ForegroundColor Cyan
+    Write-Host "  ##+====+##|    ##|##+==##+##+==##+####+ ####|    ##|     ##|     ####+ ####|" -ForegroundColor Cyan
+    Write-Host "  #######+##| #+ ##|#######|######++##+####+##|    ##|     ##|     ##+####+##|" -ForegroundColor Cyan
+    Write-Host "  +====##|##|###+##|##+==##|##+==##+##|+##++##|    ##|     ##|     ##|+##++##|" -ForegroundColor Cyan
+    Write-Host "  #######|+###+###++##|  ##|##|  ##|##| +=+ ##|    #######+#######+##| +=+ ##|" -ForegroundColor Cyan
+    Write-Host "  +======+ +==++==+ +=+  +=++=+  +=++=+     +=+    +======++======++=+     +=+" -ForegroundColor Cyan
     Write-Host ""
     Write-Host "  swarm-llm Agent  |  TLS ON  |  API Key Auth ON" -ForegroundColor DarkCyan
     Write-Host ""
@@ -192,7 +192,7 @@ function Show-ChoiceList([string]$prompt, [string[]]$items, [int]$defaultIndex =
             }
         }
         Write-Host ""
-        Write-Host "  [↑/↓] navigate   [Enter] select" -ForegroundColor DarkGray
+        Write-Host "  [Up/Down] navigate   [Enter] select" -ForegroundColor DarkGray
 
         $key = [Console]::ReadKey($true)
         switch ($key.Key) {
@@ -212,7 +212,7 @@ function Read-MaskedInput([string]$prompt) {
     finally { [System.Runtime.InteropServices.Marshal]::ZeroFreeGlobalAllocUnicode($ptr) }
 }
 
-# ── hardware detection ────────────────────────────────────────────────────────
+# -- hardware detection --------------------------------------------------------
 
 function Measure-NetworkSpeed {
     # Downloads 5 MB from Cloudflare's speed test endpoint; returns MB/s or $null
@@ -257,11 +257,11 @@ function Get-HardwareQuick {
 
 # Pick recommended model index based on VRAM
 function Get-RecommendedModelIndex([double]$vramGb) {
-    if     ($vramGb -ge 18) { return 4 } # qwen3.6:27b         — best coding 2026, 18+ GB
-    elseif ($vramGb -ge 16) { return 3 } # devstral-small-2:24b — best agentic coding
-    elseif ($vramGb -ge 12) { return 2 } # qwen3:14b            — excellent tool use, 12+ GB
-    elseif ($vramGb -ge 8)  { return 1 } # gemma4:12b           — strong general, 8+ GB
-    else                    { return 0 } # qwen3:8b             — minimum capable agentic model
+    if     ($vramGb -ge 18) { return 4 } # qwen3.6:27b          -  best coding 2026, 18+ GB
+    elseif ($vramGb -ge 16) { return 3 } # devstral-small-2:24b  -  best agentic coding
+    elseif ($vramGb -ge 12) { return 2 } # qwen3:14b             -  excellent tool use, 12+ GB
+    elseif ($vramGb -ge 8)  { return 1 } # gemma4:12b            -  strong general, 8+ GB
+    else                    { return 0 } # qwen3:8b              -  minimum capable agentic model
 }
 
 # VRAM required for a given model. Falls back to a heuristic for unknown models.
@@ -293,7 +293,7 @@ function Get-ModelCandidates([double]$vramGb) {
     return @($catalog | Where-Object { $_.vram -le $limit } | ForEach-Object { $_.id })
 }
 
-# ── system info (full, for registration) ──────────────────────────────────────
+# -- system info (full, for registration) --------------------------------------
 
 function Get-SystemInfo([hashtable]$hw) {
     $info = @{
@@ -323,14 +323,14 @@ function Get-SystemInfo([hashtable]$hw) {
     return $info
 }
 
-# ── ollama helpers ────────────────────────────────────────────────────────────
+# -- ollama helpers ------------------------------------------------------------
 
 # How many concurrent requests Ollama should handle for a given model + VRAM.
 # LLM inference is memory-bandwidth bound: a single request leaves ~50% GPU idle.
 # Parallel slots let multiple agentic sessions share the same loaded weights.
 # Uses 4 GB/slot as a conservative budget (actual KV cache with q8_0 is ~half that).
 function Get-OllamaParallel([double]$vramGb, [string]$model) {
-    if ($vramGb -le 0) { return 1 }  # CPU inference — no benefit from parallelism
+    if ($vramGb -le 0) { return 1 }  # CPU inference  -  no benefit from parallelism
     $modelVram = switch -Wildcard ($model) {
         "devstral-small-2:24b" { 15 }
         "qwen3.6:27b"          { 17 }
@@ -358,7 +358,7 @@ function Get-OllamaPath {
 }
 
 function Install-Ollama {
-    # Fast path 1: winget — instant if available, no download needed
+    # Fast path 1: winget  -  instant if available, no download needed
     if (Get-Command winget -ErrorAction SilentlyContinue) {
         Write-Step "Trying winget (fastest path)..."
         Write-Status "INSTALLING" "installing via winget..."
@@ -366,7 +366,7 @@ function Install-Ollama {
             --accept-package-agreements --accept-source-agreements 2>&1 | Out-Null
         $path = Get-OllamaPath
         if ($path) { Write-Ok "Installed via winget: $path"; return $path }
-        Write-Step "winget did not produce Ollama — falling back to portable zip"
+        Write-Step "winget did not produce Ollama  -  falling back to portable zip"
     }
 
     # Primary download method: portable zip (no installer, no UAC, no admin required)
@@ -382,7 +382,7 @@ function Install-Ollama {
 
     if ($useCached) {
         $ageMin = [math]::Round(((Get-Date) - (Get-Item $zipFile).LastWriteTime).TotalMinutes)
-        Write-Ok "Using cached zip (${ageMin}m old) — skipping download"
+        Write-Ok "Using cached zip (${ageMin}m old)  -  skipping download"
         Write-Status "INSTALLING" "using cached zip (${ageMin}m old)"
     } else {
         # Prefer coordinator mirror (EC2 bandwidth) over GitHub
@@ -426,7 +426,7 @@ function Install-Ollama {
     Expand-Archive -Path $zipFile -DestinationPath $installDir -Force
 
     $path = Get-OllamaPath
-    if (-not $path) { throw "Ollama not found after extract — check $installDir" }
+    if (-not $path) { throw "Ollama not found after extract  -  check $installDir" }
     Write-Ok "Ollama ready at: $path"
     return $path
 }
@@ -444,10 +444,10 @@ function Wait-OllamaReady([int]$port, [int]$timeoutSec = 60) {
     return $false
 }
 
-# ── coordinator comms ─────────────────────────────────────────────────────────
+# -- coordinator comms ---------------------------------------------------------
 
 function Get-AgentId {
-    # Stable UUID persisted across restarts — used as the coordinator key so
+    # Stable UUID persisted across restarts  -  used as the coordinator key so
     # machines behind the same NAT don't overwrite each other.
     $idFile = "$env:TEMP\swarm-agent-id.txt"
     if (Test-Path $idFile) {
@@ -496,7 +496,7 @@ function Register-WithCoordinator([string]$coordinator, [string]$apiKey, [int]$p
 }
 
 function Test-CoordinatorReachable([string]$coordinator, [string]$apiKey) {
-    # Step 1: connectivity — /healthz has no auth, confirms the server is up
+    # Step 1: connectivity  -  /healthz has no auth, confirms the server is up
     Write-Step "Connecting to coordinator at $coordinator ..."
     try {
         $r = Invoke-WebRequest -Uri "$coordinator/healthz" `
@@ -508,7 +508,7 @@ function Test-CoordinatorReachable([string]$coordinator, [string]$apiKey) {
         return $false
     }
 
-    # Step 2: auth check — validate key against /agent-status before spending
+    # Step 2: auth check  -  validate key against /agent-status before spending
     #         time installing Ollama or pulling a model
     Write-Step "Validating API key ..."
     try {
@@ -520,20 +520,20 @@ function Test-CoordinatorReachable([string]$coordinator, [string]$apiKey) {
     } catch {
         $code = if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode } else { 0 }
         if ($code -eq 401) {
-            Write-Err "API key rejected (401) — check the key you entered and try again."
+            Write-Err "API key rejected (401)  -  check the key you entered and try again."
         } else {
             Write-Err "Key validation failed: $_"
         }
         return $false
     }
 
-    Write-Ok "Connected — key valid."
+    Write-Ok "Connected  -  key valid."
     return $true
 }
 
 function Write-Status([string]$phase, [string]$detail = "") {
     $ts  = (Get-Date).ToString("HH:mm:ss")
-    $msg = if ($detail) { "[$ts] $phase — $detail" } else { "[$ts] $phase" }
+    $msg = if ($detail) { "[$ts] $phase  -  $detail" } else { "[$ts] $phase" }
     Write-Host "  $msg" -ForegroundColor DarkCyan
     $msg | Out-File -FilePath "$env:TEMP\swarm-agent-status.txt" -Encoding UTF8
 
@@ -570,7 +570,7 @@ function Invoke-InferWithMascot([int]$port, [string]$bodyJson, [string]$jobId = 
     )
 
     # Run the HTTP call in a background job so we can animate while it waits.
-    # Use Invoke-WebRequest + return raw Content string — avoids PS hashtable
+    # Use Invoke-WebRequest + return raw Content string  -  avoids PS hashtable
     # serialisation bugs across job runspace boundaries (ConvertTo-Json on
     # complex PSObjects can throw "index out of bounds" on PS 5.1).
     # Prefix "__ERR__:" on failure so the string itself carries the signal.
@@ -580,7 +580,7 @@ function Invoke-InferWithMascot([int]$port, [string]$bodyJson, [string]$jobId = 
             $r = Invoke-WebRequest -Uri $url -Method Post -Body $body `
                 -ContentType "application/json" -TimeoutSec 1800 `
                 -UseBasicParsing -ErrorAction Stop
-            return $r.Content   # raw JSON string — no PSObject serialisation
+            return $r.Content   # raw JSON string  -  no PSObject serialisation
         } catch {
             return "__ERR__:$_"
         }
@@ -626,7 +626,7 @@ function Invoke-InferWithMascot([int]$port, [string]$bodyJson, [string]$jobId = 
                 }
             } catch [System.Management.Automation.RuntimeException] {
                 throw  # re-throw our own "cancelled" exception
-            } catch { }  # network hiccup — keep running, coordinator will clean up
+            } catch { }  # network hiccup  -  keep running, coordinator will clean up
         }
 
         Start-Sleep -Milliseconds 150
@@ -643,7 +643,7 @@ function Invoke-InferWithMascot([int]$port, [string]$bodyJson, [string]$jobId = 
     Remove-Job $inferJob -Force
 
     if ($raw -like "__ERR__:*") { throw ($raw -replace "^__ERR__:","") }
-    # Return the raw JSON string — avoids PS 5.1's strict ConvertFrom-Json which rejects
+    # Return the raw JSON string  -  avoids PS 5.1's strict ConvertFrom-Json which rejects
     # valid-ish escape sequences (e.g. backslash-space) that some models produce in code.
     return $raw
 }
@@ -672,7 +672,7 @@ function Invoke-ModelPull([string]$modelName, [int]$port) {
             $null  = $latest -match '(\d+)%'
             $pct   = $Matches[1]
             $speed = if ($latest -match '([\d.]+ [MG]B/s)') { "  $($Matches[1])" } else { "" }
-            Write-Status "DOWNLOADING" "${pct}%${speed} — $modelName"
+            Write-Status "DOWNLOADING" "${pct}%${speed}  -  $modelName"
             $lastReport = [DateTime]::UtcNow
         }
     }
@@ -692,13 +692,13 @@ function Invoke-ModelPull([string]$modelName, [int]$port) {
     Write-Ok "Model '$modelName' ready."
 }
 
-# ── media helpers ─────────────────────────────────────────────────────────────
+# -- media helpers -------------------------------------------------------------
 
 function Install-MediaDeps {
     Write-Step "Checking media generation dependencies (Python + diffusers)..."
     $py = Get-Command python -ErrorAction SilentlyContinue
     if (-not $py) { $py = Get-Command python3 -ErrorAction SilentlyContinue }
-    if (-not $py) { throw "Python 3.10+ required for media generation — install it and add to PATH" }
+    if (-not $py) { throw "Python 3.10+ required for media generation  -  install it and add to PATH" }
     Write-Step "Python: $($py.Source)"
 
     $pkgs = @(
@@ -742,7 +742,7 @@ function Start-MediaWorkLoop([string]$coordinator, [string]$apiKey, [string]$age
                 $jobType = $job.type
                 $model   = $job.model
                 $body    = $job.body_json | ConvertFrom-Json
-                Write-Host "  [media] $jobType $($jobId.Substring(0,8)) — $model"
+                Write-Host "  [media] $jobType $($jobId.Substring(0,8))  -  $model"
 
                 $t0    = [DateTime]::UtcNow
                 $outDir = Join-Path $tmpDir $jobId
@@ -822,7 +822,7 @@ function Start-WorkLoop([string]$coordinator, [string]$apiKey, [string]$ip, [int
         }
     } catch { }
 
-    Write-Status "RUNNING" "accepting any model that fits in $vramGb GB VRAM — Ctrl+C to quit"
+    Write-Status "RUNNING" "accepting any model that fits in $vramGb GB VRAM  -  Ctrl+C to quit"
     while ($true) {
         # Restart media job if it exited unexpectedly
         if ($script:mediaJob) {
@@ -835,7 +835,7 @@ function Start-WorkLoop([string]$coordinator, [string]$apiKey, [string]$ip, [int
             }
         }
 
-        # heartbeat every 15s — re-register automatically if coordinator restarted
+        # heartbeat every 15s  -  re-register automatically if coordinator restarted
         if (([DateTime]::UtcNow - $lastHB).TotalSeconds -ge 15) {
             try {
                 Invoke-WebRequest -Uri "$coordinator/heartbeat" -Method Post `
@@ -853,7 +853,7 @@ function Start-WorkLoop([string]$coordinator, [string]$apiKey, [string]$ip, [int
         }
 
         # Ask coordinator which models have jobs waiting right now, then filter to what fits our VRAM.
-        # This replaces a static catalog — any model the coordinator knows about is fair game.
+        # This replaces a static catalog  -  any model the coordinator knows about is fair game.
         $candidates = @()
         try {
             $qResp = Invoke-RestMethod -Uri "$coordinator/agent/jobs/queued-models" `
@@ -867,7 +867,7 @@ function Start-WorkLoop([string]$coordinator, [string]$apiKey, [string]$ip, [int
 
             # Download model if not local yet
             if (-not $pulledModels.ContainsKey($model)) {
-                Write-Status "DOWNLOADING" "demand detected — pulling $model"
+                Write-Status "DOWNLOADING" "demand detected  -  pulling $model"
                 try {
                     Invoke-ModelPull $model $port
                     $pulledModels[$model] = $true
@@ -929,7 +929,7 @@ function Start-WorkLoop([string]$coordinator, [string]$apiKey, [string]$ip, [int
                 $servedJob = $true
                 break
             } catch {
-                # poll error — silently skip
+                # poll error  -  silently skip
             }
         }
 
@@ -937,7 +937,7 @@ function Start-WorkLoop([string]$coordinator, [string]$apiKey, [string]$ip, [int
     }
 }
 
-# ── interactive wizard ────────────────────────────────────────────────────────
+# -- interactive wizard --------------------------------------------------------
 
 function Start-Wizard {
     Show-Banner
@@ -1008,9 +1008,9 @@ function Start-Wizard {
     }
 }
 
-# ── main ──────────────────────────────────────────────────────────────────────
+# -- main ----------------------------------------------------------------------
 
-# Stable UUID — generated once, persisted across restarts, unique per machine
+# Stable UUID  -  generated once, persisted across restarts, unique per machine
 # even if multiple machines share the same hostname or NAT IP.
 $script:AgentId = Get-AgentId
 
@@ -1070,20 +1070,20 @@ if (-not (Wait-OllamaReady $OllamaPort 60)) {
 }
 Write-Ok "Ollama up (PID $($serverProc.Id))"
 
-# 5. Network speed test — run before pull so coordinator stores the result
+# 5. Network speed test  -  run before pull so coordinator stores the result
 Write-Step "Measuring network speed (5 MB test)..."
 $hw.network_mbps = Measure-NetworkSpeed
 if ($hw.network_mbps) {
     Write-Ok "Network speed: $($hw.network_mbps) MB/s"
 } else {
-    Write-Step "Speed test failed — skipping"
+    Write-Step "Speed test failed  -  skipping"
 }
 
 # 6. Pull default model (others are pulled on demand when a job arrives)
 $script:ollamaExe = $ollamaExe   # expose to Invoke-ModelPull
 if (-not $SkipModelPull) {
     $speedTag = if ($hw.network_mbps) { "$($hw.network_mbps) MB/s  |  " } else { "" }
-    Write-Status "DOWNLOADING" "${speedTag}starting pull — $Model"
+    Write-Status "DOWNLOADING" "${speedTag}starting pull  -  $Model"
     Invoke-ModelPull $Model $OllamaPort
 }
 
@@ -1099,8 +1099,8 @@ if ($MediaModels) {
     Write-Step "Media generation enabled: $MediaModels"
     Install-MediaDeps
     $script:mediaJob = Start-MediaWorkLoop $Coordinator $ApiKey $script:AgentId $MediaModels $script:MEDIA_INFER_PY
-    Write-Ok "Media loop started (job $($script:mediaJob.Id)) — polling $Coordinator/agent/media/jobs/next"
+    Write-Ok "Media loop started (job $($script:mediaJob.Id))  -  polling $Coordinator/agent/media/jobs/next"
 }
 
-# 9. Work loop — dynamically discovers queued models from coordinator and pulls on demand
+# 9. Work loop  -  dynamically discovers queued models from coordinator and pulls on demand
 Start-WorkLoop $Coordinator $ApiKey $myIp $OllamaPort $hw.vram_gb
