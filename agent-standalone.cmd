@@ -1,8 +1,8 @@
 @echo off
 set "_SF=%~f0" & set "_TP=%TEMP%\swarm_agent_%RANDOM%.ps1"
-powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "$c=[io.file]::ReadAllText($env:_SF); $i=$c.IndexOf('#Requires -Version'); [io.file]::WriteAllText($env:_TP,$c.Substring($i))"
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "$c=[io.file]::ReadAllText($env:_SF); $i=$c.IndexOf(''#Requires -Version''); [io.file]::WriteAllText($env:_TP,$c.Substring($i))"
 powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%_TP%" %*
-del "%_TP%" 2>nul
+del "%_TP%" 2>/dev/null
 exit /b
 <# --- batch section above is a PowerShell block comment ---
 #Requires -Version 5.1
@@ -719,8 +719,8 @@ function Install-MediaDeps {
     )
     foreach ($pkg in $pkgs) {
         Write-Step "pip install $($pkg.Split(' ')[0]) ..."
-        $args = @("-m","pip","install","--quiet") + $pkg.Split(" ")
-        & python @args 2>&1 | Where-Object { $_ -match 'error|ERROR' } | ForEach-Object { Write-Host $_ -ForegroundColor Yellow }
+        $pipArgs = @("-m","pip","install","--quiet") + $pkg.Split(" ")
+        & python @pipArgs 2>&1 | Where-Object { $_ -match 'error' } | ForEach-Object { Write-Host $_ -ForegroundColor Yellow }
     }
     Write-Ok "Media deps ready."
 }

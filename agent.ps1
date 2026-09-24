@@ -712,8 +712,8 @@ function Install-MediaDeps {
     )
     foreach ($pkg in $pkgs) {
         Write-Step "pip install $($pkg.Split(' ')[0]) ..."
-        $args = @("-m","pip","install","--quiet") + $pkg.Split(" ")
-        & python @args 2>&1 | Where-Object { $_ -match 'error|ERROR' } | ForEach-Object { Write-Host $_ -ForegroundColor Yellow }
+        $pipArgs = @("-m","pip","install","--quiet") + $pkg.Split(" ")
+        & python @pipArgs 2>&1 | Where-Object { $_ -match 'error' } | ForEach-Object { Write-Host $_ -ForegroundColor Yellow }
     }
     Write-Ok "Media deps ready."
 }
