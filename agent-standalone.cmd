@@ -2,7 +2,7 @@
 set "_SF=%~f0" & set "_TP=%TEMP%\swarm_agent_%RANDOM%.ps1"
 powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "$c=[io.file]::ReadAllText($env:_SF); $i=$c.IndexOf(''#Requires -Version''); [io.file]::WriteAllText($env:_TP,$c.Substring($i))"
 powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%_TP%" %*
-del "%_TP%" 2>/dev/null
+del "%_TP%" 2>nul
 exit /b
 <# --- batch section above is a PowerShell block comment ---
 #Requires -Version 5.1
@@ -1111,5 +1111,3 @@ if ($MediaModels) {
 
 # 9. Work loop — dynamically discovers queued models from coordinator and pulls on demand
 Start-WorkLoop $Coordinator $ApiKey $myIp $OllamaPort $hw.vram_gb
-
-#>

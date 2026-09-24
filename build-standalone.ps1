@@ -32,9 +32,7 @@ del "%_TP%" 2>nul
 exit /b
 <# --- batch section above is a PowerShell block comment ---'
 
-$footer = "`n#>"
-
-Set-Content -Path $out -Value ($header + "`n" + $psCode + $footer) -Encoding UTF8
+Set-Content -Path $out -Value ($header + "`n" + $psCode) -Encoding UTF8
 Write-Host "Built: $out"
 Write-Host "Distribute this single file — users double-click it, no other files needed."
 Write-Host "CLI flags like -SkipModelPull and -MediaModels are forwarded correctly."
