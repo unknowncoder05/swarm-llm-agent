@@ -113,7 +113,8 @@ def run_video(model, prompt, neg, out_file, duration, width, height,
         from diffusers import LTXPipeline
         pipe = LTXPipeline.from_pretrained(
             "Lightricks/LTX-Video", torch_dtype=torch.bfloat16, local_files_only=True
-        ).to("cuda")
+        )
+        pipe.enable_model_cpu_offload()
         result = pipe(
             prompt=prompt, negative_prompt=neg or None,
             width=width, height=height,

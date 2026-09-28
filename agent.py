@@ -642,7 +642,7 @@ def run_video(model, prompt, neg, out_file, duration, width, height,
 
     if model == "ltx-video":
         from diffusers import LTXPipeline
-        pipe = _load("Lightricks/LTX-Video", LTXPipeline, torch.bfloat16, token)
+        pipe = _load_offload("Lightricks/LTX-Video", LTXPipeline, torch.bfloat16, token)
         result = pipe(prompt=prompt, negative_prompt=neg or None,
                       width=width, height=height,
                       num_frames=duration * native_fps + 1,
