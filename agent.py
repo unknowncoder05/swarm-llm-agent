@@ -591,39 +591,43 @@ def _progress_cb(total_steps):
         return kwargs
     return cb
 
-def run_video(model, prompt, neg, out_file, duration, width, height, token=None):
+# frames-per-second for each model — used to compute num_frames from duration
+_MODEL_NATIVE_FPS = {"wan-2.1-t2v-1.3b": 16}
+
+def run_video(model, prompt, neg, out_file, duration, width, height,
+              guidance_scale=5.0, num_inference_steps=50, fps=8, token=None):
     import torch
-    steps = 50
-    cb = _progress_cb(steps)
+    cb = _progress_cb(num_inference_steps)
+    native_fps = _MODEL_NATIVE_FPS.get(model, fps)
+
     if model == "ltx-video":
         from diffusers import LTXPipeline
         pipe = _load("Lightricks/LTX-Video", LTXPipeline, torch.bfloat16, token)
         result = pipe(prompt=prompt, negative_prompt=neg or None,
                       width=width, height=height,
-                      num_frames=duration * 8 + 1, num_inference_steps=steps,
+                      num_frames=duration * native_fps + 1,
+                      num_inference_steps=num_inference_steps,
+                      guidance_scale=guidance_scale,
                       callback_on_step_end=cb)
-    elif model == "cogvideox-2b":
+    elif model in ("cogvideox-2b", "cogvideox-5b"):
         from diffusers import CogVideoXPipeline
-        pipe = _load("THUDM/CogVideoX-2b", CogVideoXPipeline, torch.bfloat16, token)
-        # CogVideoX is trained at 720x480, 49 frames (6s). Resolution is not adjustable.
-        result = pipe(prompt=prompt, num_inference_steps=steps,
-                      num_frames=49, guidance_scale=6,
-                      width=720, height=480,
-                      callback_on_step_end=cb)
-    elif model == "cogvideox-5b":
-        from diffusers import CogVideoXPipeline
-        pipe = _load("THUDM/CogVideoX-5b", CogVideoXPipeline, torch.bfloat16, token)
-        result = pipe(prompt=prompt, num_inference_steps=steps,
-                      num_frames=49, guidance_scale=6,
-                      width=720, height=480,
+        repo = "THUDM/CogVideoX-2b" if model == "cogvideox-2b" else "THUDM/CogVideoX-5b"
+        pipe = _load(repo, CogVideoXPipeline, torch.bfloat16, token)
+        # CogVideoX is trained at 720x480, 49 frames. Resolution is not adjustable.
+        result = pipe(prompt=prompt,
+                      num_frames=49, width=720, height=480,
+                      num_inference_steps=num_inference_steps,
+                      guidance_scale=guidance_scale,
                       callback_on_step_end=cb)
     elif model == "wan-2.1-t2v-1.3b":
         from diffusers import WanPipeline
         pipe = _load("Wan-AI/Wan2.1-T2V-1.3B-Diffusers", WanPipeline, torch.bfloat16, token)
-        # Wan requires num_frames = 4k+1; native fps is 16
+        # Wan requires num_frames = 4k+1
         result = pipe(prompt=prompt, negative_prompt=neg or None,
                       height=height, width=width,
-                      num_frames=duration * 16 + 1, guidance_scale=5.0,
+                      num_frames=duration * native_fps + 1,
+                      num_inference_steps=num_inference_steps,
+                      guidance_scale=guidance_scale,
                       callback_on_step_end=cb)
     else:
         sys.exit(f"Unknown video model: {model}")
@@ -648,15 +652,20 @@ if __name__ == "__main__":
     p.add_argument("--n",         type=int, default=1)
     p.add_argument("--size",      default="1024x1024")
     p.add_argument("--quality",   default="standard")
-    p.add_argument("--duration",  type=int, default=5)
-    p.add_argument("--width",     type=int, default=512)
-    p.add_argument("--height",    type=int, default=512)
+    p.add_argument("--duration",         type=int,   default=5)
+    p.add_argument("--width",            type=int,   default=704)
+    p.add_argument("--height",           type=int,   default=480)
+    p.add_argument("--guidance-scale",   type=float, default=5.0)
+    p.add_argument("--steps",            type=int,   default=50)
+    p.add_argument("--fps",              type=int,   default=8)
     a = p.parse_args()
     tok = a.hf_token or os.environ.get("HF_TOKEN", "")
     if a.type == "image":
         run_image(a.model, a.prompt, a.neg, a.out_dir, a.n, a.size, a.quality, tok)
     else:
-        run_video(a.model, a.prompt, a.neg, a.out_file, a.duration, a.width, a.height, tok)
+        run_video(a.model, a.prompt, a.neg, a.out_file, a.duration, a.width, a.height,
+                  guidance_scale=a.guidance_scale, num_inference_steps=a.steps,
+                  fps=a.fps, token=tok)
 '''
 
 def _cuda_install_candidates():
@@ -894,12 +903,16 @@ def _media_loop(coordinator, api_key, agent_id, vram_gb, infer_py_path, hf_token
             else:
                 out_file = str(tmp_dir / f"{job_id}.mp4")
                 cmd = [infer_python, str(infer_py_path),
-                       "--type", "video", "--model", model,
-                       "--prompt", body["prompt"],
-                       "--duration", str(body.get("duration", 5)),
-                       "--width",    str(body.get("width",  512)),
-                       "--height",   str(body.get("height", 512)),
-                       "--out-file", out_file]
+                       "--type",           "video",
+                       "--model",          model,
+                       "--prompt",         body["prompt"],
+                       "--duration",       str(body.get("duration", 5)),
+                       "--width",          str(body.get("width",  704)),
+                       "--height",         str(body.get("height", 480)),
+                       "--guidance-scale", str(body.get("guidance_scale", 5.0)),
+                       "--steps",          str(body.get("num_inference_steps", 50)),
+                       "--fps",            str(body.get("fps", 8)),
+                       "--out-file",       out_file]
                 if body.get("negative_prompt"):
                     cmd += ["--neg", body["negative_prompt"]]
                 if hf_token:

@@ -79,8 +79,12 @@ def run_image(model, prompt, neg, out_dir, n, size, quality):
         result.images[0].save(fp)
         print(fp, flush=True)
 
-def run_video(model, prompt, neg, out_file, duration, width, height):
+_MODEL_NATIVE_FPS = {"wan-2.1-t2v-1.3b": 16}
+
+def run_video(model, prompt, neg, out_file, duration, width, height,
+              guidance_scale=5.0, num_inference_steps=50, fps=8):
     import torch, numpy as np
+    native_fps = _MODEL_NATIVE_FPS.get(model, fps)
     if model == "ltx-video":
         from diffusers import LTXPipeline
         pipe = LTXPipeline.from_pretrained(
@@ -89,26 +93,19 @@ def run_video(model, prompt, neg, out_file, duration, width, height):
         result = pipe(
             prompt=prompt, negative_prompt=neg or None,
             width=width, height=height,
-            num_frames=duration * 8 + 1,
-            num_inference_steps=50,
+            num_frames=duration * native_fps + 1,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
         )
-    elif model == "cogvideox-2b":
+    elif model in ("cogvideox-2b", "cogvideox-5b"):
         from diffusers import CogVideoXPipeline
-        pipe = CogVideoXPipeline.from_pretrained(
-            "THUDM/CogVideoX-2b", torch_dtype=torch.bfloat16
-        ).to("cuda")
+        repo = "THUDM/CogVideoX-2b" if model == "cogvideox-2b" else "THUDM/CogVideoX-5b"
+        pipe = CogVideoXPipeline.from_pretrained(repo, torch_dtype=torch.bfloat16).to("cuda")
         result = pipe(
-            prompt=prompt, num_inference_steps=50,
-            num_frames=duration * 8, guidance_scale=6,
-        )
-    elif model == "cogvideox-5b":
-        from diffusers import CogVideoXPipeline
-        pipe = CogVideoXPipeline.from_pretrained(
-            "THUDM/CogVideoX-5b", torch_dtype=torch.bfloat16
-        ).to("cuda")
-        result = pipe(
-            prompt=prompt, num_inference_steps=50,
-            num_frames=duration * 8, guidance_scale=6,
+            prompt=prompt,
+            num_frames=49, width=720, height=480,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
         )
     elif model == "wan-2.1-t2v-1.3b":
         from diffusers import WanPipeline
@@ -118,7 +115,9 @@ def run_video(model, prompt, neg, out_file, duration, width, height):
         result = pipe(
             prompt=prompt, negative_prompt=neg or None,
             height=height, width=width,
-            num_frames=duration * 16, guidance_scale=5.0,
+            num_frames=duration * native_fps + 1,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
         )
     else:
         sys.exit(f"Unknown video model: {model}")
@@ -126,28 +125,32 @@ def run_video(model, prompt, neg, out_file, duration, width, height):
     frames_np = [np.array(f) for f in frames]
     import imageio
     os.makedirs(os.path.dirname(os.path.abspath(out_file)), exist_ok=True)
-    imageio.mimwrite(out_file, frames_np, fps=8, quality=8)
+    imageio.mimwrite(out_file, frames_np, fps=fps, quality=8)
     print(out_file, flush=True)
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--type",    required=True, choices=["image","video"])
-    p.add_argument("--model",   required=True)
-    p.add_argument("--prompt",  required=True)
-    p.add_argument("--neg",     default="")
-    p.add_argument("--out-dir", default=".")
-    p.add_argument("--out-file",default="out.mp4")
-    p.add_argument("--n",       type=int, default=1)
-    p.add_argument("--size",    default="1024x1024")
-    p.add_argument("--quality", default="standard")
-    p.add_argument("--duration",type=int, default=5)
-    p.add_argument("--width",   type=int, default=512)
-    p.add_argument("--height",  type=int, default=512)
+    p.add_argument("--type",           required=True, choices=["image","video"])
+    p.add_argument("--model",          required=True)
+    p.add_argument("--prompt",         required=True)
+    p.add_argument("--neg",            default="")
+    p.add_argument("--out-dir",        default=".")
+    p.add_argument("--out-file",       default="out.mp4")
+    p.add_argument("--n",              type=int,   default=1)
+    p.add_argument("--size",           default="1024x1024")
+    p.add_argument("--quality",        default="standard")
+    p.add_argument("--duration",       type=int,   default=5)
+    p.add_argument("--width",          type=int,   default=704)
+    p.add_argument("--height",         type=int,   default=480)
+    p.add_argument("--guidance-scale", type=float, default=5.0)
+    p.add_argument("--steps",          type=int,   default=50)
+    p.add_argument("--fps",            type=int,   default=8)
     a = p.parse_args()
     if a.type == "image":
         run_image(a.model, a.prompt, a.neg, a.out_dir, a.n, a.size, a.quality)
     else:
-        run_video(a.model, a.prompt, a.neg, a.out_file, a.duration, a.width, a.height)
+        run_video(a.model, a.prompt, a.neg, a.out_file, a.duration, a.width, a.height,
+                  guidance_scale=a.guidance_scale, num_inference_steps=a.steps, fps=a.fps)
 '@
 
 # -- console helpers -----------------------------------------------------------
@@ -787,6 +790,9 @@ function Start-MediaWorkLoop([string]$coordinator, [string]$apiKey, [string]$age
                                       "--duration","$($body.duration)",
                                       "--width","$($body.width)",
                                       "--height","$($body.height)",
+                                      "--guidance-scale","$($body.guidance_scale)",
+                                      "--steps","$($body.num_inference_steps)",
+                                      "--fps","$($body.fps)",
                                       "--out-file",$outFile)
                         if ($body.negative_prompt) { $pyArgs += @("--neg",$body.negative_prompt) }
                         $pyOut = python (Join-Path $tmpDir "infer.py") @pyArgs 2>&1
