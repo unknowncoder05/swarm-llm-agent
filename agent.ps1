@@ -44,18 +44,6 @@ def run_image(model, prompt, neg, out_dir, n, size, quality):
             "black-forest-labs/FLUX.1-schnell", torch_dtype=torch.bfloat16
         ).to("cuda")
         steps, guidance = 4, 0.0
-    elif model == "flux-dev":
-        from diffusers import FluxPipeline
-        pipe = FluxPipeline.from_pretrained(
-            "black-forest-labs/FLUX.1-dev", torch_dtype=torch.bfloat16
-        ).to("cuda")
-        steps, guidance = 20, 3.5
-    elif model == "sd3.5-medium":
-        from diffusers import StableDiffusion3Pipeline
-        pipe = StableDiffusion3Pipeline.from_pretrained(
-            "stabilityai/stable-diffusion-3.5-medium", torch_dtype=torch.bfloat16
-        ).to("cuda")
-        steps, guidance = 28, 7.0
     elif model == "sdxl":
         from diffusers import StableDiffusionXLPipeline
         pipe = StableDiffusionXLPipeline.from_pretrained(
@@ -97,10 +85,9 @@ def run_video(model, prompt, neg, out_file, duration, width, height,
             num_inference_steps=num_inference_steps,
             guidance_scale=guidance_scale,
         )
-    elif model in ("cogvideox-2b", "cogvideox-5b"):
+    elif model == "cogvideox-2b":
         from diffusers import CogVideoXPipeline
-        repo = "THUDM/CogVideoX-2b" if model == "cogvideox-2b" else "THUDM/CogVideoX-5b"
-        pipe = CogVideoXPipeline.from_pretrained(repo, torch_dtype=torch.bfloat16).to("cuda")
+        pipe = CogVideoXPipeline.from_pretrained("THUDM/CogVideoX-2b", torch_dtype=torch.bfloat16).to("cuda")
         result = pipe(
             prompt=prompt,
             num_frames=49, width=720, height=480,
@@ -720,14 +707,19 @@ function Install-MediaDeps {
 }
 
 function Start-MediaWorkLoop([string]$coordinator, [string]$apiKey, [string]$agentId, [double]$vramGb, [string]$inferScript) {
+    # Write the inference script to disk before Start-Job to avoid PS runspace
+    # serialization limits on large strings passed via ArgumentList.
+    $tmpDir  = Join-Path $env:TEMP "swarm-media"
+    if (-not (Test-Path $tmpDir)) { New-Item -ItemType Directory $tmpDir | Out-Null }
+    $inferPath = Join-Path $tmpDir "infer.py"
+    $inferScript | Set-Content $inferPath -Encoding UTF8
+
     return Start-Job -ScriptBlock {
-        param($coordinator, $apiKey, $agentId, $vramGb, $inferPy)
+        param($coordinator, $apiKey, $agentId, $vramGb, $inferPath)
 
         $headers       = @{ "X-API-Key" = $apiKey }
         $depsInstalled = $false
-        $tmpDir        = Join-Path $env:TEMP "swarm-media"
-        if (-not (Test-Path $tmpDir)) { New-Item -ItemType Directory $tmpDir | Out-Null }
-        $inferPy | Set-Content (Join-Path $tmpDir "infer.py") -Encoding UTF8
+        $tmpDir        = Split-Path $inferPath
         $aidEnc = [Uri]::EscapeDataString($agentId)
 
         # Report that media loop is alive and idle
@@ -837,7 +829,7 @@ function Start-MediaWorkLoop([string]$coordinator, [string]$apiKey, [string]$age
                 } catch { }
             } catch { Start-Sleep 3 }
         }
-    } -ArgumentList $coordinator, $apiKey, $agentId, $vramGb, $inferScript
+    } -ArgumentList $coordinator, $apiKey, $agentId, $vramGb, $inferPath
 }
 
 function Start-WorkLoop([string]$coordinator, [string]$apiKey, [string]$ip, [int]$port, [double]$vramGb) {
@@ -864,7 +856,7 @@ function Start-WorkLoop([string]$coordinator, [string]$apiKey, [string]$ip, [int
         # Restart media job if it exited unexpectedly
         if ($script:mediaJob) {
             $ms = $script:mediaJob.State
-            if ($ms -eq "Failed" -or $ms -eq "Completed") {
+            if ($ms -ne "Running" -and $ms -ne "NotStarted") {
                 Receive-Job $script:mediaJob 2>$null | ForEach-Object { Write-Host "  [media] $_" }
                 Remove-Job $script:mediaJob -Force -ErrorAction SilentlyContinue
                 Write-Host "  [media] loop exited ($ms), restarting..." -ForegroundColor Yellow

@@ -551,20 +551,6 @@ def run_image(model, prompt, neg, out_dir, n, size, quality, token=None):
         images = pipe(prompt=prompt, num_inference_steps=4, guidance_scale=0.0,
                       width=w, height=h, num_images_per_prompt=n).images
 
-    elif model == "flux-dev":
-        from diffusers import FluxPipeline
-        pipe = _load("black-forest-labs/FLUX.1-dev", FluxPipeline, torch.bfloat16, token)
-        images = pipe(prompt=prompt, num_inference_steps=20, guidance_scale=3.5,
-                      width=w, height=h, num_images_per_prompt=n).images
-
-    elif model == "sd3.5-medium":
-        from diffusers import StableDiffusion3Pipeline
-        pipe = _load("stabilityai/stable-diffusion-3.5-medium",
-                     StableDiffusion3Pipeline, torch.bfloat16, token)
-        images = pipe(prompt=prompt, negative_prompt=neg or None,
-                      num_inference_steps=28, guidance_scale=7.0,
-                      width=w, height=h, num_images_per_prompt=n).images
-
     elif model == "sdxl":
         from diffusers import StableDiffusionXLPipeline, StableDiffusionXLImg2ImgPipeline
         # SDXL requires base + refiner; base alone produces low-quality images.
@@ -636,10 +622,9 @@ def run_video(model, prompt, neg, out_file, duration, width, height,
                       num_inference_steps=num_inference_steps,
                       guidance_scale=guidance_scale,
                       callback_on_step_end=cb)
-    elif model in ("cogvideox-2b", "cogvideox-5b"):
+    elif model == "cogvideox-2b":
         from diffusers import CogVideoXPipeline
-        repo = "THUDM/CogVideoX-2b" if model == "cogvideox-2b" else "THUDM/CogVideoX-5b"
-        pipe = _load(repo, CogVideoXPipeline, torch.bfloat16, token)
+        pipe = _load("THUDM/CogVideoX-2b", CogVideoXPipeline, torch.bfloat16, token)
         # CogVideoX is trained at 720x480, 49 frames. Resolution is not adjustable.
         result = pipe(prompt=prompt,
                       num_frames=49, width=720, height=480,
