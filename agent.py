@@ -418,9 +418,19 @@ def test_coordinator(coordinator, api_key):
 # inference
 # ---------------------------------------------------------------------------
 def infer(port, body_json, job_id="", coordinator="", api_key=""):
-    spinners = ["-", "\\", "|", "/"]
-    result   = [None]
-    error    = [None]
+    EYE_FRAMES   = ["o . o", "@ . @", "o . o", "> . <", "o . o", "^ . ^", "o . o", "* . *"]
+    MOUTH_FRAMES = [" ___ ", " --- ", " ~~~ ", " ... ", " ### "]
+    SPINNERS     = ["-", "\\", "|", "/"]
+    THOUGHTS     = [
+        "crunching tokens   ", "hot take incoming  ", "brb, doing math    ",
+        "yes this is fast   ", "GPU go brrrr       ", "almost there...    ",
+        "big brain moment   ",
+    ]
+    FRAME_SEC      = 0.15
+    THOUGHT_FRAMES = int(5.0 / FRAME_SEC)  # advance phrase every ~5 seconds
+
+    result = [None]
+    error  = [None]
 
     def _run():
         try:
@@ -438,20 +448,38 @@ def infer(port, body_json, job_id="", coordinator="", api_key=""):
     t = threading.Thread(target=_run, daemon=True)
     t.start()
 
-    frame = 0
-    last_cancel = 0
-    thoughts = [
-        "crunching tokens   ", "hot take incoming  ", "brb, doing math    ",
-        "yes this is fast   ", "GPU go brrrr       ", "almost there...    ",
-    ]
-    t0 = time.time()
+    frame       = 0
+    last_cancel = 0.0
+    t0          = time.time()
+
+    # Reserve 5 lines for the mascot box
+    for _ in range(5):
+        print()
+
+    def _draw(eye, mouth, spin, elapsed, think):
+        sys.stdout.write(
+            "\033[5A"
+            f"\r   .-----------.   \033[K\n"
+            f"\r   |  ({eye})  |   \033[K\n"
+            f"\r   |   {mouth}   |   {spin}  {elapsed}s\033[K\n"
+            f"\r   '-----------'   \033[K\n"
+            f"\r  [{think}]\033[K\n"
+        )
+        sys.stdout.flush()
+
+    def _clear():
+        sys.stdout.write("\033[5A" + (" " * 60 + "\n") * 5 + "\033[5A")
+        sys.stdout.flush()
 
     while t.is_alive():
         elapsed = int(time.time() - t0)
-        spin    = spinners[frame % 4]
-        think   = thoughts[(frame // 4) % len(thoughts)]
-        sys.stdout.write(f"\r  {spin}  [{think}]  {elapsed}s  ")
-        sys.stdout.flush()
+        _draw(
+            eye   = EYE_FRAMES[frame   % len(EYE_FRAMES)],
+            mouth = MOUTH_FRAMES[frame % len(MOUTH_FRAMES)],
+            spin  = SPINNERS[frame     % len(SPINNERS)],
+            elapsed = elapsed,
+            think = THOUGHTS[(frame // THOUGHT_FRAMES) % len(THOUGHTS)],
+        )
 
         # Cancel check every ~5s
         if job_id and coordinator and time.time() - last_cancel >= 5:
@@ -463,7 +491,7 @@ def infer(port, body_json, job_id="", coordinator="", api_key=""):
                 )
                 if cr.status_code == 200 and cr.json().get("cancelled"):
                     t.join(timeout=2)
-                    sys.stdout.write("\r" + " " * 60 + "\r")
+                    _clear()
                     raise RuntimeError(f"Job {job_id} cancelled by coordinator")
             except RuntimeError:
                 raise
@@ -471,10 +499,9 @@ def infer(port, body_json, job_id="", coordinator="", api_key=""):
                 pass
 
         frame += 1
-        time.sleep(0.15)
+        time.sleep(FRAME_SEC)
 
-    sys.stdout.write("\r" + " " * 60 + "\r")
-    sys.stdout.flush()
+    _clear()
 
     if error[0]:
         raise RuntimeError(error[0])
