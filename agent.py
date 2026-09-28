@@ -827,6 +827,17 @@ def _media_loop(coordinator, api_key, agent_id, vram_gb, infer_py_path, hf_token
 
     print(_c(CYAN, f"  [media] thread started  -  {vram_gb} GB VRAM  -  polling {coordinator}"))
 
+    def _report(phase, model=None):
+        try:
+            url = f"{coordinator}/agent/media/status?agent_id={aid_enc}&phase={phase}"
+            if model:
+                url += f"&model={urlquote(model)}"
+            requests.post(url, headers=headers, timeout=3)
+        except Exception:
+            pass
+
+    _report("IDLE")
+
     while True:
         # ── poll coordinator ──────────────────────────────────────────────────
         try:
@@ -864,6 +875,7 @@ def _media_loop(coordinator, api_key, agent_id, vram_gb, infer_py_path, hf_token
         # ── lazy deps install ─────────────────────────────────────────────────
         if not deps_installed:
             print(_c(YELLOW, "  [media] installing deps (first job)..."))
+            _report("DOWNLOADING_DEPS", model)
             try:
                 install_media_deps()                   # install for sys.executable first
                 infer_python = _find_cuda_python()     # may fall back to py -3.12 etc.
@@ -889,6 +901,7 @@ def _media_loop(coordinator, api_key, agent_id, vram_gb, infer_py_path, hf_token
                 continue  # back to polling; next job will retry install
 
         # ── run inference ─────────────────────────────────────────────────────
+        _report("RUNNING", model)
         tmp_dir = Path(tempfile.gettempdir()) / "swarm-media"
         tmp_dir.mkdir(exist_ok=True)
         t0 = time.time()
@@ -985,6 +998,8 @@ def _media_loop(coordinator, api_key, agent_id, vram_gb, infer_py_path, hf_token
                 )
             except Exception:
                 pass
+        finally:
+            _report("IDLE")
 
 def start_media_loop(coordinator, api_key, agent_id, vram_gb, hf_token=""):
     tmp_dir    = Path(tempfile.gettempdir()) / "swarm-media"

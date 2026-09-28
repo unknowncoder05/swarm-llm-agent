@@ -730,6 +730,12 @@ function Start-MediaWorkLoop([string]$coordinator, [string]$apiKey, [string]$age
         $inferPy | Set-Content (Join-Path $tmpDir "infer.py") -Encoding UTF8
         $aidEnc = [Uri]::EscapeDataString($agentId)
 
+        # Report that media loop is alive and idle
+        try {
+            Invoke-RestMethod -Uri "$coordinator/agent/media/status?agent_id=$aidEnc&phase=IDLE" `
+                -Method Post -Headers $headers -ErrorAction SilentlyContinue | Out-Null
+        } catch { }
+
         while ($true) {
             try {
                 $resp = Invoke-WebRequest `
@@ -746,6 +752,10 @@ function Start-MediaWorkLoop([string]$coordinator, [string]$apiKey, [string]$age
 
                 if (-not $depsInstalled) {
                     Write-Host "  [media] installing diffusers + torch (first job)..." -ForegroundColor Cyan
+                    try {
+                        Invoke-RestMethod -Uri "$coordinator/agent/media/status?agent_id=$aidEnc&phase=DOWNLOADING_DEPS&model=$([Uri]::EscapeDataString($model))" `
+                            -Method Post -Headers $headers -ErrorAction SilentlyContinue | Out-Null
+                    } catch { }
                     $pkgs = @(
                         @("torch", "--index-url", "https://download.pytorch.org/whl/cu121"),
                         @("diffusers", "--upgrade"), @("transformers", "--upgrade"),
@@ -757,6 +767,11 @@ function Start-MediaWorkLoop([string]$coordinator, [string]$apiKey, [string]$age
                     $depsInstalled = $true
                     Write-Host "  [media] deps ready." -ForegroundColor Green
                 }
+
+                try {
+                    Invoke-RestMethod -Uri "$coordinator/agent/media/status?agent_id=$aidEnc&phase=RUNNING&model=$([Uri]::EscapeDataString($model))" `
+                        -Method Post -Headers $headers -ErrorAction SilentlyContinue | Out-Null
+                } catch { }
 
                 $t0    = [DateTime]::UtcNow
                 $outDir = Join-Path $tmpDir $jobId
@@ -815,6 +830,11 @@ function Start-MediaWorkLoop([string]$coordinator, [string]$apiKey, [string]$age
                             -ContentType "application/json" -Headers $headers -ErrorAction SilentlyContinue | Out-Null
                     } catch { }
                 }
+                # Back to idle after each job (success or failure)
+                try {
+                    Invoke-RestMethod -Uri "$coordinator/agent/media/status?agent_id=$aidEnc&phase=IDLE" `
+                        -Method Post -Headers $headers -ErrorAction SilentlyContinue | Out-Null
+                } catch { }
             } catch { Start-Sleep 3 }
         }
     } -ArgumentList $coordinator, $apiKey, $agentId, $vramGb, $inferScript
