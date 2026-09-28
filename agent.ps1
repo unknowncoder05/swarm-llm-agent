@@ -34,21 +34,60 @@ $ErrorActionPreference = "Stop"
 $script:MEDIA_INFER_PY = @'
 import argparse, os, sys, time
 
+def _download_model(model_id, token=None):
+    import huggingface_hub as _hf
+    try:
+        _hf.snapshot_download(model_id, local_files_only=True, token=token or None)
+        return
+    except Exception:
+        pass
+    try:
+        import tqdm as _tqdm
+        _state = {"total": 0, "done": 0, "last_pct": -1}
+        class _Bar(_tqdm.tqdm):
+            def __init__(self, *a, **kw):
+                super().__init__(*a, **kw)
+                if self.total:
+                    _state["total"] += self.total
+            def update(self, n=1):
+                result = super().update(n)
+                _state["done"] += n or 0
+                if _state["total"]:
+                    pct = int(_state["done"] / _state["total"] * 100)
+                    if pct != _state["last_pct"]:
+                        _state["last_pct"] = pct
+                        mb = _state["done"] / 1024**2
+                        total_mb = _state["total"] / 1024**2
+                        print(f"DOWNLOAD {mb:.0f}/{total_mb:.0f}", flush=True)
+                return result
+        _hf.snapshot_download(model_id, token=token or None, tqdm_class=_Bar)
+    except Exception:
+        _hf.snapshot_download(model_id, token=token or None)
+
+def _progress_cb(total_steps):
+    def cb(pipe, step, timestep, kwargs):
+        print(f"PROGRESS {step+1}/{total_steps}", flush=True)
+        return kwargs
+    return cb
+
 def run_image(model, prompt, neg, out_dir, n, size, quality):
     import torch
     w, h = map(int, size.split("x"))
     steps, guidance = 30, 7.5
     if model == "sdxl":
+        _download_model("stabilityai/stable-diffusion-xl-base-1.0")
         from diffusers import StableDiffusionXLPipeline
         pipe = StableDiffusionXLPipeline.from_pretrained(
             "stabilityai/stable-diffusion-xl-base-1.0",
-            torch_dtype=torch.float16, use_safetensors=True, variant="fp16"
+            torch_dtype=torch.float16, use_safetensors=True, variant="fp16",
+            local_files_only=True
         ).to("cuda")
     else:
         sys.exit(f"Unknown image model: {model}")
     if hasattr(pipe, "enable_model_cpu_offload"):
         pipe.enable_model_cpu_offload()
     os.makedirs(out_dir, exist_ok=True)
+    cb = _progress_cb(steps)
     for i in range(n):
         result = pipe(
             prompt=prompt,
@@ -56,6 +95,7 @@ def run_image(model, prompt, neg, out_dir, n, size, quality):
             num_inference_steps=steps,
             guidance_scale=guidance,
             width=w, height=h,
+            callback_on_step_end=cb,
         )
         fp = os.path.join(out_dir, f"img_{i}_{int(time.time())}.png")
         result.images[0].save(fp)
@@ -67,10 +107,12 @@ def run_video(model, prompt, neg, out_file, duration, width, height,
               guidance_scale=5.0, num_inference_steps=50, fps=8):
     import torch, numpy as np
     native_fps = _MODEL_NATIVE_FPS.get(model, fps)
+    cb = _progress_cb(num_inference_steps)
     if model == "ltx-video":
+        _download_model("Lightricks/LTX-Video")
         from diffusers import LTXPipeline
         pipe = LTXPipeline.from_pretrained(
-            "Lightricks/LTX-Video", torch_dtype=torch.bfloat16
+            "Lightricks/LTX-Video", torch_dtype=torch.bfloat16, local_files_only=True
         ).to("cuda")
         result = pipe(
             prompt=prompt, negative_prompt=neg or None,
@@ -78,20 +120,26 @@ def run_video(model, prompt, neg, out_file, duration, width, height,
             num_frames=duration * native_fps + 1,
             num_inference_steps=num_inference_steps,
             guidance_scale=guidance_scale,
+            callback_on_step_end=cb,
         )
     elif model == "cogvideox-2b":
+        _download_model("THUDM/CogVideoX-2b")
         from diffusers import CogVideoXPipeline
-        pipe = CogVideoXPipeline.from_pretrained("THUDM/CogVideoX-2b", torch_dtype=torch.bfloat16).to("cuda")
+        pipe = CogVideoXPipeline.from_pretrained(
+            "THUDM/CogVideoX-2b", torch_dtype=torch.bfloat16, local_files_only=True
+        ).to("cuda")
         result = pipe(
             prompt=prompt,
             num_frames=49, width=720, height=480,
             num_inference_steps=num_inference_steps,
             guidance_scale=guidance_scale,
+            callback_on_step_end=cb,
         )
     elif model == "wan-2.1-t2v-1.3b":
+        _download_model("Wan-AI/Wan2.1-T2V-1.3B-Diffusers")
         from diffusers import WanPipeline
         pipe = WanPipeline.from_pretrained(
-            "Wan-AI/Wan2.1-T2V-1.3B-Diffusers", torch_dtype=torch.bfloat16
+            "Wan-AI/Wan2.1-T2V-1.3B-Diffusers", torch_dtype=torch.bfloat16, local_files_only=True
         ).to("cuda")
         result = pipe(
             prompt=prompt, negative_prompt=neg or None,
@@ -99,6 +147,7 @@ def run_video(model, prompt, neg, out_file, duration, width, height,
             num_frames=duration * native_fps + 1,
             num_inference_steps=num_inference_steps,
             guidance_scale=guidance_scale,
+            callback_on_step_end=cb,
         )
     else:
         sys.exit(f"Unknown video model: {model}")
@@ -771,9 +820,30 @@ function Start-MediaWorkLoop([string]$coordinator, [string]$apiKey, [string]$age
                                     "--quality",$body.quality,
                                     "--out-dir",$outDir)
                         if ($body.negative_prompt) { $pyArgs += @("--neg",$body.negative_prompt) }
-                        $pyOut = python (Join-Path $tmpDir "infer.py") @pyArgs 2>&1
-                        if ($LASTEXITCODE -ne 0) { throw "inference error: $($pyOut -join ' ')" }
-                        $outPaths = @($pyOut | Where-Object { $_ -and (Test-Path "$_") })
+
+                        # Stream stdout to capture DOWNLOAD/PROGRESS lines in real time
+                        $psi = New-Object System.Diagnostics.ProcessStartInfo
+                        $psi.FileName = "python"; $psi.Arguments = ((@((Join-Path $tmpDir "infer.py")) + $pyArgs) | ForEach-Object { "`"$_`"" }) -join " "
+                        $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.UseShellExecute = $false
+                        $proc = [System.Diagnostics.Process]::Start($psi)
+                        $outLines = [System.Collections.Generic.List[string]]::new()
+                        while (-not $proc.StandardOutput.EndOfStream) {
+                            $line = $proc.StandardOutput.ReadLine()
+                            if ($line -match '^DOWNLOAD (\d+\.?\d*)/(\d+\.?\d*)') {
+                                $dlMb = [double]$Matches[1]; $totalMb = [double]$Matches[2]
+                                $pct = if ($totalMb -gt 0) { [math]::Floor($dlMb * 100 / $totalMb) } else { 0 }
+                                try { Invoke-RestMethod -Uri "$coordinator/agent/media/jobs/$jobId/progress?job_type=$jobType" -Method Post -Headers $headers -Body (@{phase="downloading";downloaded_mb=$dlMb;total_mb=$totalMb;pct=$pct}|ConvertTo-Json) -ContentType "application/json" -TimeoutSec 5 | Out-Null } catch {}
+                                Write-Host "  [media] image $($jobId.Substring(0,8)) download $([math]::Round($dlMb,0))/$([math]::Round($totalMb,0)) MB ($pct%)"
+                            } elseif ($line -match '^PROGRESS (\d+)/(\d+)') {
+                                $step = [int]$Matches[1]; $total = [int]$Matches[2]
+                                $pct = [math]::Floor($step * 100 / $total)
+                                try { Invoke-RestMethod -Uri "$coordinator/agent/media/jobs/$jobId/progress?job_type=$jobType" -Method Post -Headers $headers -Body (@{phase="generating";step=$step;total=$total;pct=$pct}|ConvertTo-Json) -ContentType "application/json" -TimeoutSec 5 | Out-Null } catch {}
+                                Write-Host "  [media] image $($jobId.Substring(0,8)) step $step/$total ($pct%)"
+                            } elseif ($line) { $outLines.Add($line) }
+                        }
+                        $stderrOut = $proc.StandardError.ReadToEnd(); $proc.WaitForExit()
+                        if ($proc.ExitCode -ne 0) { throw "inference error: $stderrOut" }
+                        $outPaths = @($outLines | Where-Object { $_ -and (Test-Path "$_") })
                         if ($outPaths.Count -eq 0) { throw "no output files produced" }
                         $outFile  = $outPaths[0]
                         $ms       = [math]::Round(([DateTime]::UtcNow - $t0).TotalMilliseconds)
@@ -796,8 +866,27 @@ function Start-MediaWorkLoop([string]$coordinator, [string]$apiKey, [string]$age
                                       "--fps","$($body.fps)",
                                       "--out-file",$outFile)
                         if ($body.negative_prompt) { $pyArgs += @("--neg",$body.negative_prompt) }
-                        $pyOut = python (Join-Path $tmpDir "infer.py") @pyArgs 2>&1
-                        if ($LASTEXITCODE -ne 0) { throw "inference error: $($pyOut -join ' ')" }
+
+                        $psi = New-Object System.Diagnostics.ProcessStartInfo
+                        $psi.FileName = "python"; $psi.Arguments = ((@((Join-Path $tmpDir "infer.py")) + $pyArgs) | ForEach-Object { "`"$_`"" }) -join " "
+                        $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.UseShellExecute = $false
+                        $proc = [System.Diagnostics.Process]::Start($psi)
+                        while (-not $proc.StandardOutput.EndOfStream) {
+                            $line = $proc.StandardOutput.ReadLine()
+                            if ($line -match '^DOWNLOAD (\d+\.?\d*)/(\d+\.?\d*)') {
+                                $dlMb = [double]$Matches[1]; $totalMb = [double]$Matches[2]
+                                $pct = if ($totalMb -gt 0) { [math]::Floor($dlMb * 100 / $totalMb) } else { 0 }
+                                try { Invoke-RestMethod -Uri "$coordinator/agent/media/jobs/$jobId/progress?job_type=$jobType" -Method Post -Headers $headers -Body (@{phase="downloading";downloaded_mb=$dlMb;total_mb=$totalMb;pct=$pct}|ConvertTo-Json) -ContentType "application/json" -TimeoutSec 5 | Out-Null } catch {}
+                                Write-Host "  [media] video $($jobId.Substring(0,8)) download $([math]::Round($dlMb,0))/$([math]::Round($totalMb,0)) MB ($pct%)"
+                            } elseif ($line -match '^PROGRESS (\d+)/(\d+)') {
+                                $step = [int]$Matches[1]; $total = [int]$Matches[2]
+                                $pct = [math]::Floor($step * 100 / $total)
+                                try { Invoke-RestMethod -Uri "$coordinator/agent/media/jobs/$jobId/progress?job_type=$jobType" -Method Post -Headers $headers -Body (@{phase="generating";step=$step;total=$total;pct=$pct}|ConvertTo-Json) -ContentType "application/json" -TimeoutSec 5 | Out-Null } catch {}
+                                Write-Host "  [media] video $($jobId.Substring(0,8)) step $step/$total ($pct%)"
+                            }
+                        }
+                        $stderrOut = $proc.StandardError.ReadToEnd(); $proc.WaitForExit()
+                        if ($proc.ExitCode -ne 0) { throw "inference error: $stderrOut" }
                         $ms   = [math]::Round(([DateTime]::UtcNow - $t0).TotalMilliseconds)
                         $data = [IO.File]::ReadAllBytes($outFile)
                         Invoke-RestMethod `

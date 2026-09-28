@@ -514,6 +514,37 @@ MEDIA_INFER_PY = r'''
 import argparse, os, sys, time, warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 
+def _download_model(model_id, token=None):
+    """Pre-download model to HF cache, emitting DOWNLOAD {mb}/{total_mb} lines to stdout."""
+    import huggingface_hub as _hf
+    try:
+        _hf.snapshot_download(model_id, local_files_only=True, token=token or None)
+        return  # already cached
+    except Exception:
+        pass
+    try:
+        import tqdm as _tqdm
+        _state = {"total": 0, "done": 0, "last_pct": -1}
+        class _Bar(_tqdm.tqdm):
+            def __init__(self, *a, **kw):
+                super().__init__(*a, **kw)
+                if self.total:
+                    _state["total"] += self.total
+            def update(self, n=1):
+                result = super().update(n)
+                _state["done"] += n or 0
+                if _state["total"]:
+                    pct = int(_state["done"] / _state["total"] * 100)
+                    if pct != _state["last_pct"]:
+                        _state["last_pct"] = pct
+                        mb = _state["done"] / 1024**2
+                        total_mb = _state["total"] / 1024**2
+                        print(f"DOWNLOAD {mb:.0f}/{total_mb:.0f}", flush=True)
+                return result
+        _hf.snapshot_download(model_id, token=token or None, tqdm_class=_Bar)
+    except Exception:
+        _hf.snapshot_download(model_id, token=token or None)
+
 def _load(model_id, pipeline_cls, dtype, token=None, **kw):
     """Load pipeline fully onto GPU. Use when model fits in VRAM."""
     import torch
@@ -522,8 +553,9 @@ def _load(model_id, pipeline_cls, dtype, token=None, **kw):
             f"CUDA unavailable (torch {torch.__version__} — CPU-only build). "
             "Re-run the agent to reinstall torch with CUDA support."
         )
+    _download_model(model_id, token)
     return pipeline_cls.from_pretrained(
-        model_id, dtype=dtype, token=token or None, **kw
+        model_id, dtype=dtype, token=token or None, local_files_only=True, **kw
     ).to("cuda")
 
 def _load_offload(model_id, pipeline_cls, dtype, token=None, **kw):
@@ -534,8 +566,9 @@ def _load_offload(model_id, pipeline_cls, dtype, token=None, **kw):
             f"CUDA unavailable (torch {torch.__version__} — CPU-only build). "
             "Re-run the agent to reinstall torch with CUDA support."
         )
+    _download_model(model_id, token)
     pipe = pipeline_cls.from_pretrained(
-        model_id, dtype=dtype, token=token or None, **kw
+        model_id, dtype=dtype, token=token or None, local_files_only=True, **kw
     )
     pipe.enable_model_cpu_offload()
     return pipe
@@ -900,12 +933,30 @@ def _media_loop(coordinator, api_key, agent_id, vram_gb, infer_py_path, hf_token
                     cmd += ["--neg", body["negative_prompt"]]
                 if hf_token:
                     cmd += ["--hf-token", hf_token]
-                proc = subprocess.run(cmd, capture_output=True, text=True,
-                                      encoding="utf-8", errors="replace")
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                        text=True, encoding="utf-8", errors="replace")
+                stdout_lines = []
+                for line in proc.stdout:
+                    line = line.strip()
+                    if line.startswith("DOWNLOAD "):
+                        try:
+                            dl_mb, total_mb = map(float, line.split()[1].split("/"))
+                            pct = int(dl_mb / total_mb * 100) if total_mb else 0
+                            requests.post(
+                                f"{coordinator}/agent/media/jobs/{job_id}/progress?job_type=image",
+                                json={"phase": "downloading", "downloaded_mb": dl_mb, "total_mb": total_mb, "pct": pct},
+                                headers=headers, timeout=5
+                            )
+                            print(f"  [media] image {job_id[:8]} download {dl_mb:.0f}/{total_mb:.0f} MB ({pct}%)")
+                        except Exception:
+                            pass
+                    else:
+                        stdout_lines.append(line)
+                stderr_out = proc.stderr.read()
+                proc.wait()
                 if proc.returncode != 0:
-                    raise RuntimeError(f"inference error: {proc.stderr}")
-                out_paths = [l.strip() for l in proc.stdout.splitlines()
-                             if l.strip() and os.path.isfile(l.strip())]
+                    raise RuntimeError(f"inference error: {stderr_out}")
+                out_paths = [l for l in stdout_lines if l and os.path.isfile(l)]
                 if not out_paths:
                     raise RuntimeError("no output files produced")
                 out_file = out_paths[0]
@@ -948,10 +999,22 @@ def _media_loop(coordinator, api_key, agent_id, vram_gb, infer_py_path, hf_token
                             pct = int(step / total * 100)
                             requests.post(
                                 f"{coordinator}/agent/media/jobs/{job_id}/progress?job_type=video",
-                                json={"step": step, "total": total, "pct": pct},
+                                json={"phase": "generating", "step": step, "total": total, "pct": pct},
                                 headers=headers, timeout=5
                             )
                             print(f"  [media] video {job_id[:8]} step {step}/{total} ({pct}%)")
+                        except Exception:
+                            pass
+                    elif line.startswith("DOWNLOAD "):
+                        try:
+                            dl_mb, total_mb = map(float, line.split()[1].split("/"))
+                            pct = int(dl_mb / total_mb * 100) if total_mb else 0
+                            requests.post(
+                                f"{coordinator}/agent/media/jobs/{job_id}/progress?job_type=video",
+                                json={"phase": "downloading", "downloaded_mb": dl_mb, "total_mb": total_mb, "pct": pct},
+                                headers=headers, timeout=5
+                            )
+                            print(f"  [media] video {job_id[:8]} download {dl_mb:.0f}/{total_mb:.0f} MB ({pct}%)")
                         except Exception:
                             pass
                 stderr_out = proc.stderr.read()
