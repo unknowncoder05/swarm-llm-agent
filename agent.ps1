@@ -827,7 +827,11 @@ function Start-MediaWorkLoop([string]$coordinator, [string]$apiKey, [string]$age
                     Invoke-RestMethod -Uri "$coordinator/agent/media/status?agent_id=$aidEnc&phase=IDLE" `
                         -Method Post -Headers $headers -ErrorAction SilentlyContinue | Out-Null
                 } catch { }
-            } catch { Start-Sleep 3 }
+            } catch {
+                $errMsg = "$_"
+                Write-Host "  [media] loop error: $errMsg" -ForegroundColor Red
+                Start-Sleep 3
+            }
         }
     } -ArgumentList $coordinator, $apiKey, $agentId, $vramGb, $inferPath
 }
