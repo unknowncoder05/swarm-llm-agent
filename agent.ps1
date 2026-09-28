@@ -38,13 +38,7 @@ def run_image(model, prompt, neg, out_dir, n, size, quality):
     import torch
     w, h = map(int, size.split("x"))
     steps, guidance = 30, 7.5
-    if model == "flux-schnell":
-        from diffusers import FluxPipeline
-        pipe = FluxPipeline.from_pretrained(
-            "black-forest-labs/FLUX.1-schnell", torch_dtype=torch.bfloat16
-        ).to("cuda")
-        steps, guidance = 4, 0.0
-    elif model == "sdxl":
+    if model == "sdxl":
         from diffusers import StableDiffusionXLPipeline
         pipe = StableDiffusionXLPipeline.from_pretrained(
             "stabilityai/stable-diffusion-xl-base-1.0",

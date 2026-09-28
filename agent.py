@@ -545,13 +545,7 @@ def run_image(model, prompt, neg, out_dir, n, size, quality, token=None):
     w, h = map(int, size.split("x"))
     os.makedirs(out_dir, exist_ok=True)
 
-    if model == "flux-schnell":
-        from diffusers import FluxPipeline
-        pipe = _load("black-forest-labs/FLUX.1-schnell", FluxPipeline, torch.bfloat16, token)
-        images = pipe(prompt=prompt, num_inference_steps=4, guidance_scale=0.0,
-                      width=w, height=h, num_images_per_prompt=n).images
-
-    elif model == "sdxl":
+    if model == "sdxl":
         from diffusers import StableDiffusionXLPipeline, StableDiffusionXLImg2ImgPipeline
         # SDXL requires base + refiner; base alone produces low-quality images.
         # enable_model_cpu_offload handles VRAM — do NOT call .to("cuda") with it.
