@@ -845,7 +845,7 @@ def install_media_deps(python_exe=None):
 
     ok("Media deps ready.")
 
-def _run_infer(cmd, on_line, silence_timeout=1800):
+def _run_infer(cmd, on_line, silence_timeout=1800, max_job_time=7200):
     """Run an infer.py subprocess, calling on_line(line) for each stdout line.
 
     on_line must return True for lines that represent real progress (PROGRESS /
@@ -872,21 +872,35 @@ def _run_infer(cmd, on_line, silence_timeout=1800):
     threading.Thread(target=_drain, args=(proc.stderr, stderr_q), daemon=True).start()
 
     last_progress = time.time()
+    job_start     = time.time()
     while True:
         try:
             line = stdout_q.get(timeout=30)
         except _queue.Empty:
+            elapsed = time.time() - job_start
             if time.time() - last_progress > silence_timeout:
                 proc.kill()
                 proc.wait()
                 raise RuntimeError(
                     f"no inference progress for {silence_timeout//60}m — killed (hung model load or CUDA init)"
                 )
+            if elapsed > max_job_time:
+                proc.kill()
+                proc.wait()
+                raise RuntimeError(
+                    f"job exceeded {max_job_time//3600}h hard limit — killed"
+                )
             continue
         if line is None:
             break
         if on_line(line.rstrip("\n")):   # meaningful progress → reset clock
             last_progress = time.time()
+        if time.time() - job_start > max_job_time:
+            proc.kill()
+            proc.wait()
+            raise RuntimeError(
+                f"job exceeded {max_job_time//3600}h hard limit — killed"
+            )
 
     proc.wait()
     stderr_lines = []
@@ -1044,7 +1058,7 @@ def _media_loop(coordinator, api_key, agent_id, vram_gb, infer_py_path, hf_token
                     else:
                         stdout_lines.append(line)
                     return False
-                rc, stderr_out = _run_infer(cmd, _on_image_line, silence_timeout=600)
+                rc, stderr_out = _run_infer(cmd, _on_image_line, silence_timeout=600, max_job_time=3600)
                 if rc != 0:
                     raise RuntimeError(f"inference error: {stderr_out}")
                 out_paths = [l for l in stdout_lines if l and os.path.isfile(l)]
