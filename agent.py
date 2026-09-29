@@ -710,12 +710,26 @@ if __name__ == "__main__":
 def _cuda_install_candidates():
     """Return ordered list of (description, pip_extra_args) to try for a CUDA torch build."""
     candidates = []
-    try:
-        out = subprocess.check_output(
-            ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
-            stderr=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace"
-        ).strip().split("\n")[0]
-        driver = float(out.split(".")[0])
+    # Try nvidia-smi on PATH first, then common Windows install locations.
+    smi_cmds = ["nvidia-smi"]
+    if platform.system() == "Windows":
+        smi_cmds += [
+            r"C:\Windows\System32\nvidia-smi.exe",
+            r"C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe",
+        ]
+    driver = None
+    for smi in smi_cmds:
+        try:
+            out = subprocess.check_output(
+                [smi, "--query-gpu=driver_version", "--format=csv,noheader"],
+                stderr=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace"
+            ).strip().split("\n")[0]
+            driver = float(out.split(".")[0])
+            break
+        except Exception:
+            continue
+
+    if driver is not None:
         # driver → CUDA toolkit version mapping (newest compat first)
         if driver >= 570:
             tags = ["cu128", "cu126", "cu124"]
@@ -728,14 +742,16 @@ def _cuda_install_candidates():
         elif driver >= 450:
             tags = ["cu118"]
         else:
-            return candidates
-        for tag in tags:
-            stable  = f"https://download.pytorch.org/whl/{tag}"
-            nightly = f"https://download.pytorch.org/whl/nightly/{tag}"
-            candidates.append((f"stable/{tag}",  ["--index-url", stable]))
-            candidates.append((f"nightly/{tag}", ["--index-url", nightly, "--pre"]))
-    except Exception:
-        pass
+            tags = ["cu128", "cu126", "cu124", "cu121", "cu118"]
+    else:
+        # nvidia-smi not found; try common CUDA versions newest-first (stable only to save time)
+        tags = ["cu128", "cu126", "cu124", "cu121", "cu118"]
+
+    for tag in tags:
+        stable  = f"https://download.pytorch.org/whl/{tag}"
+        nightly = f"https://download.pytorch.org/whl/nightly/{tag}"
+        candidates.append((f"stable/{tag}",  ["--index-url", stable]))
+        candidates.append((f"nightly/{tag}", ["--index-url", nightly, "--pre"]))
     return candidates
 
 def _torch_has_cuda(python_exe=None):
@@ -907,6 +923,26 @@ def _media_loop(coordinator, api_key, agent_id, vram_gb, infer_py_path, hf_token
                         f"{coordinator}/agent/media/jobs/{job_id}/error?job_type={job_type}",
                         json={"error": str(deps_err)}, headers=headers, timeout=10
                     )
+                except Exception:
+                    pass
+                # Self-update: if coordinator has a newer agent.py, restart to pick it up.
+                # coordinator = ".../swarm/api"; agent.py lives at ".../swarm/agent/agent.py"
+                try:
+                    base = coordinator.rstrip("/")
+                    if base.endswith("/api"):
+                        base = base[:-4]
+                    r_up = requests.get(
+                        f"{base}/agent/agent.py", headers=headers, timeout=30
+                    )
+                    if r_up.status_code == 200:
+                        new_code = r_up.text
+                        current_file = Path(__file__).resolve()
+                        current_code = current_file.read_text(encoding="utf-8", errors="replace")
+                        if new_code.strip() != current_code.strip():
+                            print(_c(YELLOW, "  [media] agent.py updated — restarting to apply fix"))
+                            current_file.write_text(new_code, encoding="utf-8")
+                            subprocess.Popen([sys.executable] + sys.argv)
+                            os._exit(0)
                 except Exception:
                     pass
                 time.sleep(5)
