@@ -848,9 +848,12 @@ def install_media_deps(python_exe=None):
 def _run_infer(cmd, on_line, silence_timeout=1800):
     """Run an infer.py subprocess, calling on_line(line) for each stdout line.
 
-    Kills the process and raises RuntimeError if no stdout is produced for
-    silence_timeout seconds (default 30 min) — catches hung model-load / CUDA
-    init.  Stderr is drained concurrently to prevent pipe-buffer deadlock.
+    on_line must return True for lines that represent real progress (PROGRESS /
+    DOWNLOAD).  The silence clock is reset ONLY on those lines — verbose
+    diffusers/torch noise that doesn't indicate forward progress is ignored for
+    timeout purposes.  Kills the process and raises RuntimeError if no
+    meaningful progress line is seen for silence_timeout seconds.
+    Stderr is drained concurrently to prevent pipe-buffer deadlock.
     Returns (returncode, stderr_text).
     """
     import queue as _queue
@@ -868,22 +871,22 @@ def _run_infer(cmd, on_line, silence_timeout=1800):
     threading.Thread(target=_drain, args=(proc.stdout, stdout_q), daemon=True).start()
     threading.Thread(target=_drain, args=(proc.stderr, stderr_q), daemon=True).start()
 
-    last_seen = time.time()
+    last_progress = time.time()
     while True:
         try:
             line = stdout_q.get(timeout=30)
         except _queue.Empty:
-            if time.time() - last_seen > silence_timeout:
+            if time.time() - last_progress > silence_timeout:
                 proc.kill()
                 proc.wait()
                 raise RuntimeError(
-                    f"subprocess silent for {silence_timeout//60}m — killed (hung model load or CUDA init)"
+                    f"no inference progress for {silence_timeout//60}m — killed (hung model load or CUDA init)"
                 )
             continue
         if line is None:
             break
-        last_seen = time.time()
-        on_line(line.rstrip("\n"))
+        if on_line(line.rstrip("\n")):   # meaningful progress → reset clock
+            last_progress = time.time()
 
     proc.wait()
     stderr_lines = []
@@ -1037,8 +1040,10 @@ def _media_loop(coordinator, api_key, agent_id, vram_gb, infer_py_path, hf_token
                             print(f"  [media] image {job_id[:8]} download {dl_mb:.0f}/{total_mb:.0f} MB ({pct}%)")
                         except Exception:
                             pass
+                        return True
                     else:
                         stdout_lines.append(line)
+                    return False
                 rc, stderr_out = _run_infer(cmd, _on_image_line, silence_timeout=600)
                 if rc != 0:
                     raise RuntimeError(f"inference error: {stderr_out}")
@@ -1087,6 +1092,7 @@ def _media_loop(coordinator, api_key, agent_id, vram_gb, infer_py_path, hf_token
                             print(f"  [media] video {job_id[:8]} step {step}/{total} ({pct}%)")
                         except Exception:
                             pass
+                        return True
                     elif line.startswith("DOWNLOAD "):
                         try:
                             dl_mb, total_mb = map(float, line.split()[1].split("/"))
@@ -1099,6 +1105,8 @@ def _media_loop(coordinator, api_key, agent_id, vram_gb, infer_py_path, hf_token
                             print(f"  [media] video {job_id[:8]} download {dl_mb:.0f}/{total_mb:.0f} MB ({pct}%)")
                         except Exception:
                             pass
+                        return True
+                    return False
                 rc, stderr_out = _run_infer(cmd, _on_video_line, silence_timeout=1800)
                 if rc != 0:
                     raise RuntimeError(f"inference error: {stderr_out}")
