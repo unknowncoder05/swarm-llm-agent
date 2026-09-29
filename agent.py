@@ -845,6 +845,59 @@ def install_media_deps(python_exe=None):
 
     ok("Media deps ready.")
 
+def _run_infer(cmd, on_line, silence_timeout=1800):
+    """Run an infer.py subprocess, calling on_line(line) for each stdout line.
+
+    Kills the process and raises RuntimeError if no stdout is produced for
+    silence_timeout seconds (default 30 min) — catches hung model-load / CUDA
+    init.  Stderr is drained concurrently to prevent pipe-buffer deadlock.
+    Returns (returncode, stderr_text).
+    """
+    import queue as _queue
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, encoding="utf-8", errors="replace")
+
+    stdout_q = _queue.Queue()
+    stderr_q = _queue.Queue()
+
+    def _drain(stream, q):
+        for ln in stream:
+            q.put(ln)
+        q.put(None)
+
+    threading.Thread(target=_drain, args=(proc.stdout, stdout_q), daemon=True).start()
+    threading.Thread(target=_drain, args=(proc.stderr, stderr_q), daemon=True).start()
+
+    last_seen = time.time()
+    while True:
+        try:
+            line = stdout_q.get(timeout=30)
+        except _queue.Empty:
+            if time.time() - last_seen > silence_timeout:
+                proc.kill()
+                proc.wait()
+                raise RuntimeError(
+                    f"subprocess silent for {silence_timeout//60}m — killed (hung model load or CUDA init)"
+                )
+            continue
+        if line is None:
+            break
+        last_seen = time.time()
+        on_line(line.rstrip("\n"))
+
+    proc.wait()
+    stderr_lines = []
+    while True:
+        try:
+            ln = stderr_q.get_nowait()
+        except _queue.Empty:
+            break
+        if ln is None:
+            break
+        stderr_lines.append(ln)
+    return proc.returncode, "".join(stderr_lines)
+
+
 def _media_loop(coordinator, api_key, agent_id, vram_gb, infer_py_path, hf_token=""):
     headers         = {"X-API-Key": api_key}
     deps_installed  = False
@@ -969,10 +1022,8 @@ def _media_loop(coordinator, api_key, agent_id, vram_gb, infer_py_path, hf_token
                     cmd += ["--neg", body["negative_prompt"]]
                 if hf_token:
                     cmd += ["--hf-token", hf_token]
-                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                        text=True, encoding="utf-8", errors="replace")
                 stdout_lines = []
-                for line in proc.stdout:
+                def _on_image_line(line):
                     line = line.strip()
                     if line.startswith("DOWNLOAD "):
                         try:
@@ -988,9 +1039,8 @@ def _media_loop(coordinator, api_key, agent_id, vram_gb, infer_py_path, hf_token
                             pass
                     else:
                         stdout_lines.append(line)
-                stderr_out = proc.stderr.read()
-                proc.wait()
-                if proc.returncode != 0:
+                rc, stderr_out = _run_infer(cmd, _on_image_line, silence_timeout=600)
+                if rc != 0:
                     raise RuntimeError(f"inference error: {stderr_out}")
                 out_paths = [l for l in stdout_lines if l and os.path.isfile(l)]
                 if not out_paths:
@@ -1023,11 +1073,7 @@ def _media_loop(coordinator, api_key, agent_id, vram_gb, infer_py_path, hf_token
                     cmd += ["--neg", body["negative_prompt"]]
                 if hf_token:
                     cmd += ["--hf-token", hf_token]
-                # Stream stdout to capture PROGRESS lines in real time
-                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                        text=True, encoding="utf-8", errors="replace")
-                stderr_buf = []
-                for line in proc.stdout:
+                def _on_video_line(line):
                     line = line.strip()
                     if line.startswith("PROGRESS "):
                         try:
@@ -1053,9 +1099,8 @@ def _media_loop(coordinator, api_key, agent_id, vram_gb, infer_py_path, hf_token
                             print(f"  [media] video {job_id[:8]} download {dl_mb:.0f}/{total_mb:.0f} MB ({pct}%)")
                         except Exception:
                             pass
-                stderr_out = proc.stderr.read()
-                proc.wait()
-                if proc.returncode != 0:
+                rc, stderr_out = _run_infer(cmd, _on_video_line, silence_timeout=1800)
+                if rc != 0:
                     raise RuntimeError(f"inference error: {stderr_out}")
                 ms   = int((time.time() - t0) * 1000)
                 data = open(out_file, "rb").read()
