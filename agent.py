@@ -959,18 +959,25 @@ def _media_loop(coordinator, api_key, agent_id, vram_gb, infer_py_path, hf_token
                     current_code = current_file.read_text(encoding="utf-8", errors="replace")
                     if new_code.strip() != current_code.strip():
                         print(_c(YELLOW, "  [media] new agent.py detected — restarting to apply update"))
-                        current_file.write_text(new_code, encoding="utf-8")
-                        # Use absolute path so the new process can find the script
-                        # regardless of working directory. On Windows, also detach
-                        # the child so it survives when this process exits.
-                        _new_cmd = [sys.executable, str(current_file)] + sys.argv[1:]
+                        import tempfile as _tf
+                        # Try to overwrite in-place; fall back to a temp file
+                        # if the location is read-only (common on Windows).
+                        try:
+                            current_file.write_text(new_code, encoding="utf-8")
+                            _target = current_file
+                        except Exception as _we:
+                            print(_c(YELLOW, f"  [media] in-place write failed ({_we}); using temp file"))
+                            _tmp = Path(_tf.mktemp(suffix="_swarm_agent.py"))
+                            _tmp.write_text(new_code, encoding="utf-8")
+                            _target = _tmp
+                        _new_cmd = [sys.executable, str(_target)] + sys.argv[1:]
                         _kwargs = {}
                         if platform.system() == "Windows":
                             _kwargs["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
                         subprocess.Popen(_new_cmd, **_kwargs)
                         os._exit(0)
-            except Exception:
-                pass
+            except Exception as _ue:
+                print(_c(YELLOW, f"  [media] self-update check failed: {_ue}"))
 
         # ── poll coordinator ──────────────────────────────────────────────────
         try:
@@ -1045,8 +1052,15 @@ def _media_loop(coordinator, api_key, agent_id, vram_gb, infer_py_path, hf_token
                         current_code = current_file.read_text(encoding="utf-8", errors="replace")
                         if new_code.strip() != current_code.strip():
                             print(_c(YELLOW, "  [media] agent.py updated — restarting to apply fix"))
-                            current_file.write_text(new_code, encoding="utf-8")
-                            _new_cmd = [sys.executable, str(current_file)] + sys.argv[1:]
+                            import tempfile as _tf
+                            try:
+                                current_file.write_text(new_code, encoding="utf-8")
+                                _target = current_file
+                            except Exception as _we:
+                                _tmp = Path(_tf.mktemp(suffix="_swarm_agent.py"))
+                                _tmp.write_text(new_code, encoding="utf-8")
+                                _target = _tmp
+                            _new_cmd = [sys.executable, str(_target)] + sys.argv[1:]
                             _kwargs = {}
                             if platform.system() == "Windows":
                                 _kwargs["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
