@@ -960,7 +960,14 @@ def _media_loop(coordinator, api_key, agent_id, vram_gb, infer_py_path, hf_token
                     if new_code.strip() != current_code.strip():
                         print(_c(YELLOW, "  [media] new agent.py detected — restarting to apply update"))
                         current_file.write_text(new_code, encoding="utf-8")
-                        subprocess.Popen([sys.executable] + sys.argv)
+                        # Use absolute path so the new process can find the script
+                        # regardless of working directory. On Windows, also detach
+                        # the child so it survives when this process exits.
+                        _new_cmd = [sys.executable, str(current_file)] + sys.argv[1:]
+                        _kwargs = {}
+                        if platform.system() == "Windows":
+                            _kwargs["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+                        subprocess.Popen(_new_cmd, **_kwargs)
                         os._exit(0)
             except Exception:
                 pass
@@ -1039,7 +1046,11 @@ def _media_loop(coordinator, api_key, agent_id, vram_gb, infer_py_path, hf_token
                         if new_code.strip() != current_code.strip():
                             print(_c(YELLOW, "  [media] agent.py updated — restarting to apply fix"))
                             current_file.write_text(new_code, encoding="utf-8")
-                            subprocess.Popen([sys.executable] + sys.argv)
+                            _new_cmd = [sys.executable, str(current_file)] + sys.argv[1:]
+                            _kwargs = {}
+                            if platform.system() == "Windows":
+                                _kwargs["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+                            subprocess.Popen(_new_cmd, **_kwargs)
                             os._exit(0)
                 except Exception:
                     pass
