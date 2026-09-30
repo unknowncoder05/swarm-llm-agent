@@ -939,8 +939,29 @@ def _media_loop(coordinator, api_key, agent_id, vram_gb, infer_py_path, hf_token
             pass
 
     _report("IDLE")
+    _last_update_check = 0.0
 
     while True:
+        # ── periodic self-update check ────────────────────────────────────────
+        if time.time() - _last_update_check >= 300:
+            _last_update_check = time.time()
+            try:
+                base = coordinator.rstrip("/")
+                if base.endswith("/api"):
+                    base = base[:-4]
+                r_up = requests.get(f"{base}/agent/agent.py", headers=headers, timeout=15)
+                if r_up.status_code == 200:
+                    new_code = r_up.text
+                    current_file = Path(__file__).resolve()
+                    current_code = current_file.read_text(encoding="utf-8", errors="replace")
+                    if new_code.strip() != current_code.strip():
+                        print(_c(YELLOW, "  [media] new agent.py detected — restarting to apply update"))
+                        current_file.write_text(new_code, encoding="utf-8")
+                        subprocess.Popen([sys.executable] + sys.argv)
+                        os._exit(0)
+            except Exception:
+                pass
+
         # ── poll coordinator ──────────────────────────────────────────────────
         try:
             r = requests.get(
