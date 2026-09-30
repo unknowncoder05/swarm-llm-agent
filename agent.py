@@ -515,34 +515,36 @@ import argparse, os, sys, time, warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 def _download_model(model_id, token=None):
-    """Pre-download model to HF cache, emitting DOWNLOAD {mb}/{total_mb} lines to stdout."""
+    """Pre-download model to HF cache, emitting DOWNLOAD {mb}/0 lines to stdout."""
     import huggingface_hub as _hf
     try:
         _hf.snapshot_download(model_id, local_files_only=True, token=token or None)
         return  # already cached
     except Exception:
         pass
+    # Model is not cached — download it while emitting periodic progress via a monitor thread.
+    import threading, pathlib, os as _os
+    _cache_root = pathlib.Path(
+        _os.environ.get("HF_HUB_CACHE") or
+        _os.environ.get("HUGGINGFACE_HUB_CACHE") or
+        pathlib.Path.home() / ".cache" / "huggingface" / "hub"
+    )
+    _model_dir = _cache_root / ("models--" + model_id.replace("/", "--"))
+    _stop = threading.Event()
+    def _emit():
+        while not _stop.wait(8):
+            try:
+                sz = sum(f.stat().st_size for f in _model_dir.rglob("*") if f.is_file())
+                print(f"DOWNLOAD {sz // 1024 // 1024}/0", flush=True)
+            except Exception:
+                print("DOWNLOAD 0/0", flush=True)
+    t = threading.Thread(target=_emit, daemon=True)
+    t.start()
     try:
-        import tqdm as _tqdm
-        _state = {"total": 0, "done": 0, "last_mb": -10}
-        class _Bar(_tqdm.tqdm):
-            def __init__(self, *a, **kw):
-                super().__init__(*a, **kw)
-                if self.total:
-                    _state["total"] += self.total
-            def update(self, n=1):
-                result = super().update(n)
-                _state["done"] += n or 0
-                mb = _state["done"] / 1024**2
-                if mb - _state["last_mb"] >= 10:   # emit every 10 MB regardless of known total
-                    _state["last_mb"] = mb
-                    total_mb = _state["total"] / 1024**2
-                    pct = int(mb / total_mb * 100) if _state["total"] else 0
-                    print(f"DOWNLOAD {mb:.0f}/{total_mb:.0f}", flush=True)
-                return result
-        _hf.snapshot_download(model_id, token=token or None, tqdm_class=_Bar)
-    except Exception:
         _hf.snapshot_download(model_id, token=token or None)
+    finally:
+        _stop.set()
+        t.join(timeout=5)
 
 def _load(model_id, pipeline_cls, dtype, token=None, **kw):
     """Load pipeline fully onto GPU. Use when model fits in VRAM."""
@@ -856,8 +858,9 @@ def _run_infer(cmd, on_line, silence_timeout=1800, max_job_time=7200):
     Returns (returncode, stderr_text).
     """
     import queue as _queue
+    _env = {**os.environ, "PYTHONUNBUFFERED": "1"}
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            text=True, encoding="utf-8", errors="replace")
+                            text=True, encoding="utf-8", errors="replace", env=_env)
 
     stdout_q = _queue.Queue()
     stderr_q = _queue.Queue()
@@ -1168,7 +1171,7 @@ def _media_loop(coordinator, api_key, agent_id, vram_gb, infer_py_path, hf_token
                             pass
                         return True
                     return False
-                rc, stderr_out = _run_infer(cmd, _on_video_line, silence_timeout=1800)
+                rc, stderr_out = _run_infer(cmd, _on_video_line, silence_timeout=3600)
                 if rc != 0:
                     raise RuntimeError(f"inference error: {stderr_out}")
                 ms   = int((time.time() - t0) * 1000)
