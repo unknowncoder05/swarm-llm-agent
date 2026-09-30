@@ -514,6 +514,9 @@ MEDIA_INFER_PY = r'''
 import argparse, os, sys, time, warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 
+class _AbortJob(Exception):
+    pass
+
 def _download_model(model_id, token=None):
     """Pre-download model to HF cache, emitting DOWNLOAD {mb}/{total_mb} lines to stdout."""
     import huggingface_hub as _hf
@@ -524,7 +527,7 @@ def _download_model(model_id, token=None):
         pass
     try:
         import tqdm as _tqdm
-        _state = {"total": 0, "done": 0, "last_pct": -1}
+        _state = {"total": 0, "done": 0, "last_mb": -10}
         class _Bar(_tqdm.tqdm):
             def __init__(self, *a, **kw):
                 super().__init__(*a, **kw)
@@ -533,13 +536,12 @@ def _download_model(model_id, token=None):
             def update(self, n=1):
                 result = super().update(n)
                 _state["done"] += n or 0
-                if _state["total"]:
-                    pct = int(_state["done"] / _state["total"] * 100)
-                    if pct != _state["last_pct"]:
-                        _state["last_pct"] = pct
-                        mb = _state["done"] / 1024**2
-                        total_mb = _state["total"] / 1024**2
-                        print(f"DOWNLOAD {mb:.0f}/{total_mb:.0f}", flush=True)
+                mb = _state["done"] / 1024**2
+                if mb - _state["last_mb"] >= 10:   # emit every 10 MB regardless of known total
+                    _state["last_mb"] = mb
+                    total_mb = _state["total"] / 1024**2
+                    pct = int(mb / total_mb * 100) if _state["total"] else 0
+                    print(f"DOWNLOAD {mb:.0f}/{total_mb:.0f}", flush=True)
                 return result
         _hf.snapshot_download(model_id, token=token or None, tqdm_class=_Bar)
     except Exception:
@@ -893,8 +895,13 @@ def _run_infer(cmd, on_line, silence_timeout=1800, max_job_time=7200):
             continue
         if line is None:
             break
-        if on_line(line.rstrip("\n")):   # meaningful progress → reset clock
-            last_progress = time.time()
+        try:
+            if on_line(line.rstrip("\n")):   # meaningful progress → reset clock
+                last_progress = time.time()
+        except Exception:
+            proc.kill()
+            proc.wait()
+            raise
         if time.time() - job_start > max_job_time:
             proc.kill()
             proc.wait()
@@ -1040,18 +1047,28 @@ def _media_loop(coordinator, api_key, agent_id, vram_gb, infer_py_path, hf_token
                 if hf_token:
                     cmd += ["--hf-token", hf_token]
                 stdout_lines = []
+                _img_dl_stall = [0.0, time.time()]  # [last_mb, last_advance_time]
                 def _on_image_line(line):
                     line = line.strip()
                     if line.startswith("DOWNLOAD "):
                         try:
                             dl_mb, total_mb = map(float, line.split()[1].split("/"))
                             pct = int(dl_mb / total_mb * 100) if total_mb else 0
-                            requests.post(
+                            if dl_mb > _img_dl_stall[0]:
+                                _img_dl_stall[0] = dl_mb
+                                _img_dl_stall[1] = time.time()
+                            elif time.time() - _img_dl_stall[1] > 120:
+                                raise RuntimeError(f"download stalled at {dl_mb:.0f} MB for 2min — killed")
+                            resp = requests.post(
                                 f"{coordinator}/agent/media/jobs/{job_id}/progress?job_type=image",
                                 json={"phase": "downloading", "downloaded_mb": dl_mb, "total_mb": total_mb, "pct": pct},
                                 headers=headers, timeout=5
                             )
+                            if resp.ok and resp.json().get("abort"):
+                                raise _AbortJob("coordinator aborted job")
                             print(f"  [media] image {job_id[:8]} download {dl_mb:.0f}/{total_mb:.0f} MB ({pct}%)")
+                        except (_AbortJob, RuntimeError):
+                            raise
                         except Exception:
                             pass
                         return True
@@ -1092,18 +1109,23 @@ def _media_loop(coordinator, api_key, agent_id, vram_gb, infer_py_path, hf_token
                     cmd += ["--neg", body["negative_prompt"]]
                 if hf_token:
                     cmd += ["--hf-token", hf_token]
+                _vid_dl_stall = [0.0, time.time()]  # [last_mb, last_advance_time]
                 def _on_video_line(line):
                     line = line.strip()
                     if line.startswith("PROGRESS "):
                         try:
                             step, total = map(int, line.split()[1].split("/"))
                             pct = int(step / total * 100)
-                            requests.post(
+                            resp = requests.post(
                                 f"{coordinator}/agent/media/jobs/{job_id}/progress?job_type=video",
                                 json={"phase": "generating", "step": step, "total": total, "pct": pct},
                                 headers=headers, timeout=5
                             )
+                            if resp.ok and resp.json().get("abort"):
+                                raise _AbortJob("coordinator aborted job")
                             print(f"  [media] video {job_id[:8]} step {step}/{total} ({pct}%)")
+                        except (_AbortJob,):
+                            raise
                         except Exception:
                             pass
                         return True
@@ -1111,12 +1133,21 @@ def _media_loop(coordinator, api_key, agent_id, vram_gb, infer_py_path, hf_token
                         try:
                             dl_mb, total_mb = map(float, line.split()[1].split("/"))
                             pct = int(dl_mb / total_mb * 100) if total_mb else 0
-                            requests.post(
+                            if dl_mb > _vid_dl_stall[0]:
+                                _vid_dl_stall[0] = dl_mb
+                                _vid_dl_stall[1] = time.time()
+                            elif time.time() - _vid_dl_stall[1] > 120:
+                                raise RuntimeError(f"download stalled at {dl_mb:.0f} MB for 2min — killed")
+                            resp = requests.post(
                                 f"{coordinator}/agent/media/jobs/{job_id}/progress?job_type=video",
                                 json={"phase": "downloading", "downloaded_mb": dl_mb, "total_mb": total_mb, "pct": pct},
                                 headers=headers, timeout=5
                             )
+                            if resp.ok and resp.json().get("abort"):
+                                raise _AbortJob("coordinator aborted job")
                             print(f"  [media] video {job_id[:8]} download {dl_mb:.0f}/{total_mb:.0f} MB ({pct}%)")
+                        except (_AbortJob, RuntimeError):
+                            raise
                         except Exception:
                             pass
                         return True
