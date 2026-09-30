@@ -514,9 +514,6 @@ MEDIA_INFER_PY = r'''
 import argparse, os, sys, time, warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 
-class _AbortJob(Exception):
-    pass
-
 def _download_model(model_id, token=None):
     """Pre-download model to HF cache, emitting DOWNLOAD {mb}/{total_mb} lines to stdout."""
     import huggingface_hub as _hf
@@ -895,13 +892,13 @@ def _run_infer(cmd, on_line, silence_timeout=1800, max_job_time=7200):
             continue
         if line is None:
             break
-        try:
-            if on_line(line.rstrip("\n")):   # meaningful progress → reset clock
-                last_progress = time.time()
-        except Exception:
+        result = on_line(line.rstrip("\n"))
+        if result == "abort":
             proc.kill()
             proc.wait()
-            raise
+            raise RuntimeError("coordinator aborted job")
+        elif result:
+            last_progress = time.time()
         if time.time() - job_start > max_job_time:
             proc.kill()
             proc.wait()
@@ -1065,9 +1062,9 @@ def _media_loop(coordinator, api_key, agent_id, vram_gb, infer_py_path, hf_token
                                 headers=headers, timeout=5
                             )
                             if resp.ok and resp.json().get("abort"):
-                                raise _AbortJob("coordinator aborted job")
+                                return "abort"
                             print(f"  [media] image {job_id[:8]} download {dl_mb:.0f}/{total_mb:.0f} MB ({pct}%)")
-                        except (_AbortJob, RuntimeError):
+                        except RuntimeError:
                             raise
                         except Exception:
                             pass
@@ -1122,10 +1119,8 @@ def _media_loop(coordinator, api_key, agent_id, vram_gb, infer_py_path, hf_token
                                 headers=headers, timeout=5
                             )
                             if resp.ok and resp.json().get("abort"):
-                                raise _AbortJob("coordinator aborted job")
+                                return "abort"
                             print(f"  [media] video {job_id[:8]} step {step}/{total} ({pct}%)")
-                        except (_AbortJob,):
-                            raise
                         except Exception:
                             pass
                         return True
@@ -1144,9 +1139,9 @@ def _media_loop(coordinator, api_key, agent_id, vram_gb, infer_py_path, hf_token
                                 headers=headers, timeout=5
                             )
                             if resp.ok and resp.json().get("abort"):
-                                raise _AbortJob("coordinator aborted job")
+                                return "abort"
                             print(f"  [media] video {job_id[:8]} download {dl_mb:.0f}/{total_mb:.0f} MB ({pct}%)")
-                        except (_AbortJob, RuntimeError):
+                        except RuntimeError:
                             raise
                         except Exception:
                             pass
